@@ -1,4 +1,4 @@
-# dialects/mysql/dml.py
+# dialects/sqlite/dml.py
 # Copyright (C) 2005-2025 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
@@ -7,15 +7,19 @@
 from __future__ import annotations
 
 from typing import Any
-from typing import Dict
 from typing import List
-from typing import Mapping
 from typing import Optional
 from typing import Tuple
 from typing import Union
 
-from ... import exc
+from .._typing import _OnConflictIndexElementsT
+from .._typing import _OnConflictIndexWhereT
+from .._typing import _OnConflictSetT
+from .._typing import _OnConflictWhereT
 from ... import util
+from ...sql import coercions
+from ...sql import roles
+from ...sql import schema
 from ...sql._typing import _DMLTableArgument
 from ...sql.base import _exclusive_against
 from ...sql.base import _generative
@@ -23,203 +27,237 @@ from ...sql.base import ColumnCollection
 from ...sql.base import ReadOnlyColumnCollection
 from ...sql.dml import Insert as StandardInsert
 from ...sql.elements import ClauseElement
+from ...sql.elements import ColumnElement
 from ...sql.elements import KeyedColumnElement
+from ...sql.elements import TextClause
 from ...sql.expression import alias
-from ...sql.selectable import NamedFromClause
 from ...util.typing import Self
-
 
 __all__ = ("Insert", "insert")
 
 
 def insert(table: _DMLTableArgument) -> Insert:
-    """Construct a MySQL/MariaDB-specific variant :class:`_mysql.Insert`
+    """Construct a sqlite-specific variant :class:`_sqlite.Insert`
     construct.
 
     .. container:: inherited_member
 
-        The :func:`sqlalchemy.dialects.mysql.insert` function creates
-        a :class:`sqlalchemy.dialects.mysql.Insert`.  This class is based
+        The :func:`sqlalchemy.dialects.sqlite.insert` function creates
+        a :class:`sqlalchemy.dialects.sqlite.Insert`.  This class is based
         on the dialect-agnostic :class:`_sql.Insert` construct which may
         be constructed using the :func:`_sql.insert` function in
         SQLAlchemy Core.
 
-    The :class:`_mysql.Insert` construct includes additional methods
-    :meth:`_mysql.Insert.on_duplicate_key_update`.
+    The :class:`_sqlite.Insert` construct includes additional methods
+    :meth:`_sqlite.Insert.on_conflict_do_update`,
+    :meth:`_sqlite.Insert.on_conflict_do_nothing`.
 
     """
     return Insert(table)
 
 
 class Insert(StandardInsert):
-    """MySQL-specific implementation of INSERT.
+    """SQLite-specific implementation of INSERT.
 
-    Adds methods for MySQL-specific syntaxes such as ON DUPLICATE KEY UPDATE.
+    Adds methods for SQLite-specific syntaxes such as ON CONFLICT.
 
-    The :class:`~.mysql.Insert` object is created using the
-    :func:`sqlalchemy.dialects.mysql.insert` function.
+    The :class:`_sqlite.Insert` object is created using the
+    :func:`sqlalchemy.dialects.sqlite.insert` function.
 
-    .. versionadded:: 1.2
+    .. versionadded:: 1.4
+
+    .. seealso::
+
+        :ref:`sqlite_on_conflict_insert`
 
     """
 
-    stringify_dialect = "mysql"
+    stringify_dialect = "sqlite"
     inherit_cache = False
 
-    @property
-    def inserted(
+    @util.memoized_property
+    def excluded(
         self,
     ) -> ReadOnlyColumnCollection[str, KeyedColumnElement[Any]]:
-        """Provide the "inserted" namespace for an ON DUPLICATE KEY UPDATE
-        statement
+        """Provide the ``excluded`` namespace for an ON CONFLICT statement
 
-        MySQL's ON DUPLICATE KEY UPDATE clause allows reference to the row
-        that would be inserted, via a special function called ``VALUES()``.
-        This attribute provides all columns in this row to be referenceable
-        such that they will render within a ``VALUES()`` function inside the
-        ON DUPLICATE KEY UPDATE clause.    The attribute is named ``.inserted``
-        so as not to conflict with the existing
-        :meth:`_expression.Insert.values` method.
+        SQLite's ON CONFLICT clause allows reference to the row that would
+        be inserted, known as ``excluded``.  This attribute provides
+        all columns in this row to be referenceable.
 
-        .. tip::  The :attr:`_mysql.Insert.inserted` attribute is an instance
+        .. tip::  The :attr:`_sqlite.Insert.excluded` attribute is an instance
             of :class:`_expression.ColumnCollection`, which provides an
             interface the same as that of the :attr:`_schema.Table.c`
             collection described at :ref:`metadata_tables_and_columns`.
             With this collection, ordinary names are accessible like attributes
-            (e.g. ``stmt.inserted.some_column``), but special names and
+            (e.g. ``stmt.excluded.some_column``), but special names and
             dictionary method names should be accessed using indexed access,
-            such as ``stmt.inserted["column name"]`` or
-            ``stmt.inserted["values"]``.  See the docstring for
+            such as ``stmt.excluded["column name"]`` or
+            ``stmt.excluded["values"]``.  See the docstring for
             :class:`_expression.ColumnCollection` for further examples.
 
-        .. seealso::
-
-            :ref:`mysql_insert_on_duplicate_key_update` - example of how
-            to use :attr:`_expression.Insert.inserted`
-
         """
-        return self.inserted_alias.columns
+        return alias(self.table, name="excluded").columns
 
-    @util.memoized_property
-    def inserted_alias(self) -> NamedFromClause:
-        return alias(self.table, name="inserted")
-
-    @_generative
-    @_exclusive_against(
+    _on_conflict_exclusive = _exclusive_against(
         "_post_values_clause",
         msgs={
-            "_post_values_clause": "This Insert construct already "
-            "has an ON DUPLICATE KEY clause present"
+            "_post_values_clause": "This Insert construct already has "
+            "an ON CONFLICT clause established"
         },
     )
-    def on_duplicate_key_update(self, *args: _UpdateArg, **kw: Any) -> Self:
+
+    @_generative
+    @_on_conflict_exclusive
+    def on_conflict_do_update(
+        self,
+        index_elements: _OnConflictIndexElementsT = None,
+        index_where: _OnConflictIndexWhereT = None,
+        set_: _OnConflictSetT = None,
+        where: _OnConflictWhereT = None,
+    ) -> Self:
         r"""
-        Specifies the ON DUPLICATE KEY UPDATE clause.
+        Specifies a DO UPDATE SET action for ON CONFLICT clause.
 
-        :param \**kw:  Column keys linked to UPDATE values.  The
-         values may be any SQL expression or supported literal Python
-         values.
+        :param index_elements:
+         A sequence consisting of string column names, :class:`_schema.Column`
+         objects, or other column expression objects that will be used
+         to infer a target index or unique constraint.
 
-        .. warning:: This dictionary does **not** take into account
-           Python-specified default UPDATE values or generation functions,
-           e.g. those specified using :paramref:`_schema.Column.onupdate`.
-           These values will not be exercised for an ON DUPLICATE KEY UPDATE
-           style of UPDATE, unless values are manually specified here.
+        :param index_where:
+         Additional WHERE criterion that can be used to infer a
+         conditional target index.
 
-        :param \*args: As an alternative to passing key/value parameters,
-         a dictionary or list of 2-tuples can be passed as a single positional
-         argument.
+        :param set\_:
+         A dictionary or other mapping object
+         where the keys are either names of columns in the target table,
+         or :class:`_schema.Column` objects or other ORM-mapped columns
+         matching that of the target table, and expressions or literals
+         as values, specifying the ``SET`` actions to take.
 
-         Passing a single dictionary is equivalent to the keyword argument
-         form::
+         .. versionadded:: 1.4 The
+            :paramref:`_sqlite.Insert.on_conflict_do_update.set_`
+            parameter supports :class:`_schema.Column` objects from the target
+            :class:`_schema.Table` as keys.
 
-            insert().on_duplicate_key_update({"name": "some name"})
+         .. warning:: This dictionary does **not** take into account
+            Python-specified default UPDATE values or generation functions,
+            e.g. those specified using :paramref:`_schema.Column.onupdate`.
+            These values will not be exercised for an ON CONFLICT style of
+            UPDATE, unless they are manually specified in the
+            :paramref:`.Insert.on_conflict_do_update.set_` dictionary.
 
-         Passing a list of 2-tuples indicates that the parameter assignments
-         in the UPDATE clause should be ordered as sent, in a manner similar
-         to that described for the :class:`_expression.Update`
-         construct overall
-         in :ref:`tutorial_parameter_ordered_updates`::
-
-            insert().on_duplicate_key_update(
-                [
-                    ("name", "some name"),
-                    ("value", "some value"),
-                ]
-            )
-
-         .. versionchanged:: 1.3 parameters can be specified as a dictionary
-            or list of 2-tuples; the latter form provides for parameter
-            ordering.
-
-
-        .. versionadded:: 1.2
-
-        .. seealso::
-
-            :ref:`mysql_insert_on_duplicate_key_update`
+        :param where:
+         Optional argument. An expression object representing a ``WHERE``
+         clause that restricts the rows affected by ``DO UPDATE SET``. Rows not
+         meeting the ``WHERE`` condition will not be updated (effectively a
+         ``DO NOTHING`` for those rows).
 
         """
-        if args and kw:
-            raise exc.ArgumentError(
-                "Can't pass kwargs and positional arguments simultaneously"
-            )
 
-        if args:
-            if len(args) > 1:
-                raise exc.ArgumentError(
-                    "Only a single dictionary or list of tuples "
-                    "is accepted positionally."
-                )
-            values = args[0]
-        else:
-            values = kw
+        self._post_values_clause = OnConflictDoUpdate(
+            index_elements, index_where, set_, where
+        )
+        return self
 
-        self._post_values_clause = OnDuplicateClause(
-            self.inserted_alias, values
+    @_generative
+    @_on_conflict_exclusive
+    def on_conflict_do_nothing(
+        self,
+        index_elements: _OnConflictIndexElementsT = None,
+        index_where: _OnConflictIndexWhereT = None,
+    ) -> Self:
+        """
+        Specifies a DO NOTHING action for ON CONFLICT clause.
+
+        :param index_elements:
+         A sequence consisting of string column names, :class:`_schema.Column`
+         objects, or other column expression objects that will be used
+         to infer a target index or unique constraint.
+
+        :param index_where:
+         Additional WHERE criterion that can be used to infer a
+         conditional target index.
+
+        """
+
+        self._post_values_clause = OnConflictDoNothing(
+            index_elements, index_where
         )
         return self
 
 
-class OnDuplicateClause(ClauseElement):
-    __visit_name__ = "on_duplicate_key_update"
+class OnConflictClause(ClauseElement):
+    stringify_dialect = "sqlite"
 
-    _parameter_ordering: Optional[List[str]] = None
-
-    update: Dict[str, Any]
-    stringify_dialect = "mysql"
+    inferred_target_elements: Optional[List[Union[str, schema.Column[Any]]]]
+    inferred_target_whereclause: Optional[
+        Union[ColumnElement[Any], TextClause]
+    ]
 
     def __init__(
-        self, inserted_alias: NamedFromClause, update: _UpdateArg
-    ) -> None:
-        self.inserted_alias = inserted_alias
-
-        # auto-detect that parameters should be ordered.   This is copied from
-        # Update._proces_colparams(), however we don't look for a special flag
-        # in this case since we are not disambiguating from other use cases as
-        # we are in Update.values().
-        if isinstance(update, list) and (
-            update and isinstance(update[0], tuple)
-        ):
-            self._parameter_ordering = [key for key, value in update]
-            update = dict(update)
-
-        if isinstance(update, dict):
-            if not update:
-                raise ValueError(
-                    "update parameter dictionary must not be empty"
+        self,
+        index_elements: _OnConflictIndexElementsT = None,
+        index_where: _OnConflictIndexWhereT = None,
+    ):
+        if index_elements is not None:
+            self.inferred_target_elements = [
+                coercions.expect(roles.DDLConstraintColumnRole, column)
+                for column in index_elements
+            ]
+            self.inferred_target_whereclause = (
+                coercions.expect(
+                    roles.WhereHavingRole,
+                    index_where,
                 )
-        elif isinstance(update, ColumnCollection):
-            update = dict(update)
+                if index_where is not None
+                else None
+            )
+        else:
+            self.inferred_target_elements = (
+                self.inferred_target_whereclause
+            ) = None
+
+
+class OnConflictDoNothing(OnConflictClause):
+    __visit_name__ = "on_conflict_do_nothing"
+
+
+class OnConflictDoUpdate(OnConflictClause):
+    __visit_name__ = "on_conflict_do_update"
+
+    update_values_to_set: List[Tuple[Union[schema.Column[Any], str], Any]]
+    update_whereclause: Optional[ColumnElement[Any]]
+
+    def __init__(
+        self,
+        index_elements: _OnConflictIndexElementsT = None,
+        index_where: _OnConflictIndexWhereT = None,
+        set_: _OnConflictSetT = None,
+        where: _OnConflictWhereT = None,
+    ):
+        super().__init__(
+            index_elements=index_elements,
+            index_where=index_where,
+        )
+
+        if isinstance(set_, dict):
+            if not set_:
+                raise ValueError("set parameter dictionary must not be empty")
+        elif isinstance(set_, ColumnCollection):
+            set_ = dict(set_)
         else:
             raise ValueError(
-                "update parameter must be a non-empty dictionary "
+                "set parameter must be a non-empty dictionary "
                 "or a ColumnCollection such as the `.c.` collection "
                 "of a Table object"
             )
-        self.update = update
-
-
-_UpdateArg = Union[
-    Mapping[Any, Any], List[Tuple[str, Any]], ColumnCollection[Any, Any]
-]
+        self.update_values_to_set = [
+            (coercions.expect(roles.DMLColumnRole, key), value)
+            for key, value in set_.items()
+        ]
+        self.update_whereclause = (
+            coercions.expect(roles.WhereHavingRole, where)
+            if where is not None
+            else None
+        )

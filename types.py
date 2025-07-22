@@ -1,264 +1,252 @@
-# dialects/oracle/types.py
-# Copyright (C) 2005-2025 the SQLAlchemy authors and contributors
+# dialects/postgresql/types.py
+# Copyright (C) 2013-2025 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
-# mypy: ignore-errors
 from __future__ import annotations
 
 import datetime as dt
+from typing import Any
 from typing import Optional
+from typing import overload
 from typing import Type
 from typing import TYPE_CHECKING
+from uuid import UUID as _python_UUID
 
-from ... import exc
 from ...sql import sqltypes
-from ...types import NVARCHAR
-from ...types import VARCHAR
+from ...sql import type_api
+from ...util.typing import Literal
 
 if TYPE_CHECKING:
     from ...engine.interfaces import Dialect
+    from ...sql.operators import OperatorType
     from ...sql.type_api import _LiteralProcessorType
+    from ...sql.type_api import TypeEngine
+
+_DECIMAL_TYPES = (1231, 1700)
+_FLOAT_TYPES = (700, 701, 1021, 1022)
+_INT_TYPES = (20, 21, 23, 26, 1005, 1007, 1016)
 
 
-class RAW(sqltypes._Binary):
-    __visit_name__ = "RAW"
+class PGUuid(sqltypes.UUID[sqltypes._UUID_RETURN]):
+    render_bind_cast = True
+    render_literal_cast = True
+
+    if TYPE_CHECKING:
+
+        @overload
+        def __init__(
+            self: PGUuid[_python_UUID], as_uuid: Literal[True] = ...
+        ) -> None: ...
+
+        @overload
+        def __init__(
+            self: PGUuid[str], as_uuid: Literal[False] = ...
+        ) -> None: ...
+
+        def __init__(self, as_uuid: bool = True) -> None: ...
 
 
-OracleRaw = RAW
+class BYTEA(sqltypes.LargeBinary):
+    __visit_name__ = "BYTEA"
 
 
-class NCLOB(sqltypes.Text):
-    __visit_name__ = "NCLOB"
+class _NetworkAddressTypeMixin:
+
+    def coerce_compared_value(
+        self, op: Optional[OperatorType], value: Any
+    ) -> TypeEngine[Any]:
+        if TYPE_CHECKING:
+            assert isinstance(self, TypeEngine)
+        return self
 
 
-class VARCHAR2(VARCHAR):
-    __visit_name__ = "VARCHAR2"
+class INET(_NetworkAddressTypeMixin, sqltypes.TypeEngine[str]):
+    __visit_name__ = "INET"
 
 
-NVARCHAR2 = NVARCHAR
+PGInet = INET
 
 
-class NUMBER(sqltypes.Numeric, sqltypes.Integer):
-    __visit_name__ = "NUMBER"
-
-    def __init__(self, precision=None, scale=None, asdecimal=None):
-        if asdecimal is None:
-            asdecimal = bool(scale and scale > 0)
-
-        super().__init__(precision=precision, scale=scale, asdecimal=asdecimal)
-
-    def adapt(self, impltype):
-        ret = super().adapt(impltype)
-        # leave a hint for the DBAPI handler
-        ret._is_oracle_number = True
-        return ret
-
-    @property
-    def _type_affinity(self):
-        if bool(self.scale and self.scale > 0):
-            return sqltypes.Numeric
-        else:
-            return sqltypes.Integer
+class CIDR(_NetworkAddressTypeMixin, sqltypes.TypeEngine[str]):
+    __visit_name__ = "CIDR"
 
 
-class FLOAT(sqltypes.FLOAT):
-    """Oracle Database FLOAT.
+PGCidr = CIDR
 
-    This is the same as :class:`_sqltypes.FLOAT` except that
-    an Oracle Database -specific :paramref:`_oracle.FLOAT.binary_precision`
-    parameter is accepted, and
-    the :paramref:`_sqltypes.Float.precision` parameter is not accepted.
 
-    Oracle Database FLOAT types indicate precision in terms of "binary
-    precision", which defaults to 126. For a REAL type, the value is 63. This
-    parameter does not cleanly map to a specific number of decimal places but
-    is roughly equivalent to the desired number of decimal places divided by
-    0.3103.
+class MACADDR(_NetworkAddressTypeMixin, sqltypes.TypeEngine[str]):
+    __visit_name__ = "MACADDR"
 
-    .. versionadded:: 2.0
+
+PGMacAddr = MACADDR
+
+
+class MACADDR8(_NetworkAddressTypeMixin, sqltypes.TypeEngine[str]):
+    __visit_name__ = "MACADDR8"
+
+
+PGMacAddr8 = MACADDR8
+
+
+class MONEY(sqltypes.TypeEngine[str]):
+    r"""Provide the PostgreSQL MONEY type.
+
+    Depending on driver, result rows using this type may return a
+    string value which includes currency symbols.
+
+    For this reason, it may be preferable to provide conversion to a
+    numerically-based currency datatype using :class:`_types.TypeDecorator`::
+
+        import re
+        import decimal
+        from sqlalchemy import Dialect
+        from sqlalchemy import TypeDecorator
+
+
+        class NumericMoney(TypeDecorator):
+            impl = MONEY
+
+            def process_result_value(self, value: Any, dialect: Dialect) -> None:
+                if value is not None:
+                    # adjust this for the currency and numeric
+                    m = re.match(r"\$([\d.]+)", value)
+                    if m:
+                        value = decimal.Decimal(m.group(1))
+                return value
+
+    Alternatively, the conversion may be applied as a CAST using
+    the :meth:`_types.TypeDecorator.column_expression` method as follows::
+
+        import decimal
+        from sqlalchemy import cast
+        from sqlalchemy import TypeDecorator
+
+
+        class NumericMoney(TypeDecorator):
+            impl = MONEY
+
+            def column_expression(self, column: Any):
+                return cast(column, Numeric())
+
+    .. versionadded:: 1.2
+
+    """  # noqa: E501
+
+    __visit_name__ = "MONEY"
+
+
+class OID(sqltypes.TypeEngine[int]):
+    """Provide the PostgreSQL OID type."""
+
+    __visit_name__ = "OID"
+
+
+class REGCONFIG(sqltypes.TypeEngine[str]):
+    """Provide the PostgreSQL REGCONFIG type.
+
+    .. versionadded:: 2.0.0rc1
 
     """
 
-    __visit_name__ = "FLOAT"
+    __visit_name__ = "REGCONFIG"
+
+
+class TSQUERY(sqltypes.TypeEngine[str]):
+    """Provide the PostgreSQL TSQUERY type.
+
+    .. versionadded:: 2.0.0rc1
+
+    """
+
+    __visit_name__ = "TSQUERY"
+
+
+class REGCLASS(sqltypes.TypeEngine[str]):
+    """Provide the PostgreSQL REGCLASS type.
+
+    .. versionadded:: 1.2.7
+
+    """
+
+    __visit_name__ = "REGCLASS"
+
+
+class TIMESTAMP(sqltypes.TIMESTAMP):
+    """Provide the PostgreSQL TIMESTAMP type."""
+
+    __visit_name__ = "TIMESTAMP"
 
     def __init__(
-        self,
-        binary_precision=None,
-        asdecimal=False,
-        decimal_return_scale=None,
-    ):
-        r"""
-        Construct a FLOAT
+        self, timezone: bool = False, precision: Optional[int] = None
+    ) -> None:
+        """Construct a TIMESTAMP.
 
-        :param binary_precision: Oracle Database binary precision value to be
-         rendered in DDL. This may be approximated to the number of decimal
-         characters using the formula "decimal precision = 0.30103 * binary
-         precision".  The default value used by Oracle Database for FLOAT /
-         DOUBLE PRECISION is 126.
+        :param timezone: boolean value if timezone present, default False
+        :param precision: optional integer precision value
 
-        :param asdecimal: See :paramref:`_sqltypes.Float.asdecimal`
-
-        :param decimal_return_scale: See
-         :paramref:`_sqltypes.Float.decimal_return_scale`
+         .. versionadded:: 1.4
 
         """
-        super().__init__(
-            asdecimal=asdecimal, decimal_return_scale=decimal_return_scale
-        )
-        self.binary_precision = binary_precision
+        super().__init__(timezone=timezone)
+        self.precision = precision
 
 
-class BINARY_DOUBLE(sqltypes.Double):
-    """Implement the Oracle ``BINARY_DOUBLE`` datatype.
+class TIME(sqltypes.TIME):
+    """PostgreSQL TIME type."""
 
-    This datatype differs from the Oracle ``DOUBLE`` datatype in that it
-    delivers a true 8-byte FP value.   The datatype may be combined with a
-    generic :class:`.Double` datatype using :meth:`.TypeEngine.with_variant`.
+    __visit_name__ = "TIME"
 
-    .. seealso::
+    def __init__(
+        self, timezone: bool = False, precision: Optional[int] = None
+    ) -> None:
+        """Construct a TIME.
 
-        :ref:`oracle_float_support`
+        :param timezone: boolean value if timezone present, default False
+        :param precision: optional integer precision value
 
+         .. versionadded:: 1.4
 
-    """
-
-    __visit_name__ = "BINARY_DOUBLE"
-
-
-class BINARY_FLOAT(sqltypes.Float):
-    """Implement the Oracle ``BINARY_FLOAT`` datatype.
-
-    This datatype differs from the Oracle ``FLOAT`` datatype in that it
-    delivers a true 4-byte FP value.   The datatype may be combined with a
-    generic :class:`.Float` datatype using :meth:`.TypeEngine.with_variant`.
-
-    .. seealso::
-
-        :ref:`oracle_float_support`
+        """
+        super().__init__(timezone=timezone)
+        self.precision = precision
 
 
-    """
+class INTERVAL(type_api.NativeForEmulated, sqltypes._AbstractInterval):
+    """PostgreSQL INTERVAL type."""
 
-    __visit_name__ = "BINARY_FLOAT"
-
-
-class BFILE(sqltypes.LargeBinary):
-    __visit_name__ = "BFILE"
-
-
-class LONG(sqltypes.Text):
-    __visit_name__ = "LONG"
-
-
-class _OracleDateLiteralRender:
-    def _literal_processor_datetime(self, dialect):
-        def process(value):
-            if getattr(value, "microsecond", None):
-                value = (
-                    f"""TO_TIMESTAMP"""
-                    f"""('{value.isoformat().replace("T", " ")}', """
-                    """'YYYY-MM-DD HH24:MI:SS.FF')"""
-                )
-            else:
-                value = (
-                    f"""TO_DATE"""
-                    f"""('{value.isoformat().replace("T", " ")}', """
-                    """'YYYY-MM-DD HH24:MI:SS')"""
-                )
-            return value
-
-        return process
-
-    def _literal_processor_date(self, dialect):
-        def process(value):
-            if getattr(value, "microsecond", None):
-                value = (
-                    f"""TO_TIMESTAMP"""
-                    f"""('{value.isoformat().split("T")[0]}', """
-                    """'YYYY-MM-DD')"""
-                )
-            else:
-                value = (
-                    f"""TO_DATE"""
-                    f"""('{value.isoformat().split("T")[0]}', """
-                    """'YYYY-MM-DD')"""
-                )
-            return value
-
-        return process
-
-
-class DATE(_OracleDateLiteralRender, sqltypes.DateTime):
-    """Provide the Oracle Database DATE type.
-
-    This type has no special Python behavior, except that it subclasses
-    :class:`_types.DateTime`; this is to suit the fact that the Oracle Database
-    ``DATE`` type supports a time value.
-
-    """
-
-    __visit_name__ = "DATE"
-
-    def literal_processor(self, dialect):
-        return self._literal_processor_datetime(dialect)
-
-    def _compare_type_affinity(self, other):
-        return other._type_affinity in (sqltypes.DateTime, sqltypes.Date)
-
-
-class _OracleDate(_OracleDateLiteralRender, sqltypes.Date):
-    def literal_processor(self, dialect):
-        return self._literal_processor_date(dialect)
-
-
-class INTERVAL(sqltypes.NativeForEmulated, sqltypes._AbstractInterval):
     __visit_name__ = "INTERVAL"
+    native = True
 
-    def __init__(self, day_precision=None, second_precision=None):
+    def __init__(
+        self, precision: Optional[int] = None, fields: Optional[str] = None
+    ) -> None:
         """Construct an INTERVAL.
 
-        Note that only DAY TO SECOND intervals are currently supported.
-        This is due to a lack of support for YEAR TO MONTH intervals
-        within available DBAPIs.
+        :param precision: optional integer precision value
+        :param fields: string fields specifier.  allows storage of fields
+         to be limited, such as ``"YEAR"``, ``"MONTH"``, ``"DAY TO HOUR"``,
+         etc.
 
-        :param day_precision: the day precision value.  this is the number of
-          digits to store for the day field.  Defaults to "2"
-        :param second_precision: the second precision value.  this is the
-          number of digits to store for the fractional seconds field.
-          Defaults to "6".
+         .. versionadded:: 1.2
 
         """
-        self.day_precision = day_precision
-        self.second_precision = second_precision
-
-    @classmethod
-    def _adapt_from_generic_interval(cls, interval):
-        return INTERVAL(
-            day_precision=interval.day_precision,
-            second_precision=interval.second_precision,
-        )
+        self.precision = precision
+        self.fields = fields
 
     @classmethod
     def adapt_emulated_to_native(
-        cls, interval: sqltypes.Interval, **kw  # type: ignore[override]
-    ):
-        return INTERVAL(
-            day_precision=interval.day_precision,
-            second_precision=interval.second_precision,
-        )
+        cls, interval: sqltypes.Interval, **kw: Any  # type: ignore[override]
+    ) -> INTERVAL:
+        return INTERVAL(precision=interval.second_precision)
 
     @property
-    def _type_affinity(self):
+    def _type_affinity(self) -> Type[sqltypes.Interval]:
         return sqltypes.Interval
 
-    def as_generic(self, allow_nulltype=False):
-        return sqltypes.Interval(
-            native=True,
-            second_precision=self.second_precision,
-            day_precision=self.day_precision,
-        )
+    def as_generic(self, allow_nulltype: bool = False) -> sqltypes.Interval:
+        return sqltypes.Interval(native=True, second_precision=self.precision)
 
     @property
     def python_type(self) -> Type[dt.timedelta]:
@@ -268,49 +256,58 @@ class INTERVAL(sqltypes.NativeForEmulated, sqltypes._AbstractInterval):
         self, dialect: Dialect
     ) -> Optional[_LiteralProcessorType[dt.timedelta]]:
         def process(value: dt.timedelta) -> str:
-            return f"NUMTODSINTERVAL({value.total_seconds()}, 'SECOND')"
+            return f"make_interval(secs=>{value.total_seconds()})"
 
         return process
 
 
-class TIMESTAMP(sqltypes.TIMESTAMP):
-    """Oracle Database implementation of ``TIMESTAMP``, which supports
-    additional Oracle Database-specific modes
+PGInterval = INTERVAL
 
-    .. versionadded:: 2.0
+
+class BIT(sqltypes.TypeEngine[int]):
+    __visit_name__ = "BIT"
+
+    def __init__(
+        self, length: Optional[int] = None, varying: bool = False
+    ) -> None:
+        if varying:
+            # BIT VARYING can be unlimited-length, so no default
+            self.length = length
+        else:
+            # BIT without VARYING defaults to length 1
+            self.length = length or 1
+        self.varying = varying
+
+
+PGBit = BIT
+
+
+class TSVECTOR(sqltypes.TypeEngine[str]):
+    """The :class:`_postgresql.TSVECTOR` type implements the PostgreSQL
+    text search type TSVECTOR.
+
+    It can be used to do full text queries on natural language
+    documents.
+
+    .. seealso::
+
+        :ref:`postgresql_match`
 
     """
 
-    def __init__(self, timezone: bool = False, local_timezone: bool = False):
-        """Construct a new :class:`_oracle.TIMESTAMP`.
-
-        :param timezone: boolean.  Indicates that the TIMESTAMP type should
-         use Oracle Database's ``TIMESTAMP WITH TIME ZONE`` datatype.
-
-        :param local_timezone: boolean.  Indicates that the TIMESTAMP type
-         should use Oracle Database's ``TIMESTAMP WITH LOCAL TIME ZONE``
-         datatype.
+    __visit_name__ = "TSVECTOR"
 
 
-        """
-        if timezone and local_timezone:
-            raise exc.ArgumentError(
-                "timezone and local_timezone are mutually exclusive"
-            )
-        super().__init__(timezone=timezone)
-        self.local_timezone = local_timezone
+class CITEXT(sqltypes.TEXT):
+    """Provide the PostgreSQL CITEXT type.
 
-
-class ROWID(sqltypes.TypeEngine):
-    """Oracle Database ROWID type.
-
-    When used in a cast() or similar, generates ROWID.
+    .. versionadded:: 2.0.7
 
     """
 
-    __visit_name__ = "ROWID"
+    __visit_name__ = "CITEXT"
 
-
-class _OracleBoolean(sqltypes.Boolean):
-    def get_dbapi_type(self, dbapi):
-        return dbapi.NUMBER
+    def coerce_compared_value(
+        self, op: Optional[OperatorType], value: Any
+    ) -> TypeEngine[Any]:
+        return self

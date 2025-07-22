@@ -1,4 +1,4 @@
-# dialects/mysql/json.py
+# dialects/sqlite/json.py
 # Copyright (C) 2005-2025 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
@@ -10,29 +10,40 @@ from ... import types as sqltypes
 
 
 class JSON(sqltypes.JSON):
-    """MySQL JSON type.
+    """SQLite JSON type.
 
-    MySQL supports JSON as of version 5.7.
-    MariaDB supports JSON (as an alias for LONGTEXT) as of version 10.2.
+    SQLite supports JSON as of version 3.9 through its JSON1_ extension. Note
+    that JSON1_ is a
+    `loadable extension <https://www.sqlite.org/loadext.html>`_ and as such
+    may not be available, or may require run-time loading.
 
-    :class:`_mysql.JSON` is used automatically whenever the base
-    :class:`_types.JSON` datatype is used against a MySQL or MariaDB backend.
+    :class:`_sqlite.JSON` is used automatically whenever the base
+    :class:`_types.JSON` datatype is used against a SQLite backend.
 
     .. seealso::
 
         :class:`_types.JSON` - main documentation for the generic
         cross-platform JSON datatype.
 
-    The :class:`.mysql.JSON` type supports persistence of JSON values
+    The :class:`_sqlite.JSON` type supports persistence of JSON values
     as well as the core index operations provided by :class:`_types.JSON`
     datatype, by adapting the operations to render the ``JSON_EXTRACT``
-    function at the database level.
+    function wrapped in the ``JSON_QUOTE`` function at the database level.
+    Extracted values are quoted in order to ensure that the results are
+    always JSON string values.
+
+
+    .. versionadded:: 1.3
+
+
+    .. _JSON1: https://www.sqlite.org/json1.html
 
     """
 
-    pass
 
-
+# Note: these objects currently match exactly those of MySQL, however since
+# these are not generalizable to all JSON implementations, remain separately
+# implemented for each dialect.
 class _FormatTypeMixin:
     def _format_value(self, value):
         raise NotImplementedError()
