@@ -1,2 +1,2 @@
-"""A package that contains models that represent entities.
+"""For modules related to installing packages.
 """
