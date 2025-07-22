@@ -1,56 +1,70 @@
+"""Primary application entrypoint.
+"""
+import locale
+import logging
 import os
 import sys
-# DON'T CHANGE THIS !!!
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from typing import List, Optional
 
-from flask import Flask, send_from_directory
-from flask_cors import CORS
-from src.models.user import db, User
-from src.routes.user import user_bp
-from src.routes.product import product_bp
-from src.routes.seed_data import seed_bp
+from pip._internal.cli.autocompletion import autocomplete
+from pip._internal.cli.main_parser import parse_command
+from pip._internal.commands import create_command
+from pip._internal.exceptions import PipError
+from pip._internal.utils import deprecation
 
-app = Flask(__name__, static_folder=os.path.join(os.path.dirname(__file__), 'static'))
-app.config['SECRET_KEY'] = 'asdf#FGSgvasgf$5$WGT'
+logger = logging.getLogger(__name__)
 
-# Enable CORS for all routes
-CORS(app, origins=['*'])
 
-# Register blueprints
-app.register_blueprint(user_bp, url_prefix='/api')
-app.register_blueprint(product_bp, url_prefix='/api')
-app.register_blueprint(seed_bp, url_prefix='/api')
+# Do not import and use main() directly! Using it directly is actively
+# discouraged by pip's maintainers. The name, location and behavior of
+# this function is subject to change, so calling it directly is not
+# portable across different pip versions.
 
-# Database configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{os.path.join(os.path.dirname(__file__), 'database', 'app.db')}"
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db.init_app(app)
+# In addition, running pip in-process is unsupported and unsafe. This is
+# elaborated in detail at
+# https://pip.pypa.io/en/stable/user_guide/#using-pip-from-your-program.
+# That document also provides suggestions that should work for nearly
+# all users that are considering importing and using main() directly.
 
-with app.app_context():
-    # Import all models to ensure they're registered
-    from src.models.product import Product, Category, Cart, Order, OrderItem
-    db.create_all()
+# However, we know that certain users will still want to invoke pip
+# in-process. If you understand and accept the implications of using pip
+# in an unsupported manner, the best approach is to use runpy to avoid
+# depending on the exact location of this entry point.
 
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve(path):
-    static_folder_path = app.static_folder
-    if static_folder_path is None:
-            return "Static folder not configured", 404
+# The following example shows how to use runpy to invoke pip in that
+# case:
+#
+#     sys.argv = ["pip", your, args, here]
+#     runpy.run_module("pip", run_name="__main__")
+#
+# Note that this will exit the process after running, unlike a direct
+# call to main. As it is not safe to do any processing after calling
+# main, this should not be an issue in practice.
 
-    if path != "" and os.path.exists(os.path.join(static_folder_path, path)):
-        return send_from_directory(static_folder_path, path)
-    else:
-        index_path = os.path.join(static_folder_path, 'index.html')
-        if os.path.exists(index_path):
-            return send_from_directory(static_folder_path, 'index.html')
-        else:
-            return "index.html not found", 404
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    return {'status': 'healthy', 'message': 'MAUMA API is running'}
+def main(args: Optional[List[str]] = None) -> int:
+    if args is None:
+        args = sys.argv[1:]
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Configure our deprecation warnings to be sent through loggers
+    deprecation.install_warning_logger()
 
+    autocomplete()
+
+    try:
+        cmd_name, cmd_args = parse_command(args)
+    except PipError as exc:
+        sys.stderr.write(f"ERROR: {exc}")
+        sys.stderr.write(os.linesep)
+        sys.exit(1)
+
+    # Needed for locale.getpreferredencoding(False) to work
+    # in pip._internal.utils.encoding.auto_decode
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error as e:
+        # setlocale can apparently crash if locale are uninitialized
+        logger.debug("Ignoring error %s when setting locale", e)
+    command = create_command(cmd_name, isolated=("--isolated" in cmd_args))
+
+    return command.main(cmd_args)

@@ -1,10 +1,42 @@
-Metadata-Version: 2.4
-Name: Jinja2
-Version: 3.1.6
-Summary: A very fast and expressive template engine.
+Metadata-Version: 2.1
+Name: MarkupSafe
+Version: 3.0.2
+Summary: Safely add untrusted strings to HTML/XML markup.
 Maintainer-email: Pallets <contact@palletsprojects.com>
-Requires-Python: >=3.7
-Description-Content-Type: text/markdown
+License: Copyright 2010 Pallets
+        
+        Redistribution and use in source and binary forms, with or without
+        modification, are permitted provided that the following conditions are
+        met:
+        
+        1.  Redistributions of source code must retain the above copyright
+            notice, this list of conditions and the following disclaimer.
+        
+        2.  Redistributions in binary form must reproduce the above copyright
+            notice, this list of conditions and the following disclaimer in the
+            documentation and/or other materials provided with the distribution.
+        
+        3.  Neither the name of the copyright holder nor the names of its
+            contributors may be used to endorse or promote products derived from
+            this software without specific prior written permission.
+        
+        THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+        "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+        LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+        PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+        HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+        SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+        TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+        PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+        LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+        NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+        SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+        
+Project-URL: Donate, https://palletsprojects.com/donate
+Project-URL: Documentation, https://markupsafe.palletsprojects.com/
+Project-URL: Changes, https://markupsafe.palletsprojects.com/changes/
+Project-URL: Source, https://github.com/pallets/markupsafe/
+Project-URL: Chat, https://discord.gg/pallets
 Classifier: Development Status :: 5 - Production/Stable
 Classifier: Environment :: Web Environment
 Classifier: Intended Audience :: Developers
@@ -14,71 +46,47 @@ Classifier: Programming Language :: Python
 Classifier: Topic :: Internet :: WWW/HTTP :: Dynamic Content
 Classifier: Topic :: Text Processing :: Markup :: HTML
 Classifier: Typing :: Typed
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
 License-File: LICENSE.txt
-Requires-Dist: MarkupSafe>=2.0
-Requires-Dist: Babel>=2.7 ; extra == "i18n"
-Project-URL: Changes, https://jinja.palletsprojects.com/changes/
-Project-URL: Chat, https://discord.gg/pallets
-Project-URL: Documentation, https://jinja.palletsprojects.com/
-Project-URL: Donate, https://palletsprojects.com/donate
-Project-URL: Source, https://github.com/pallets/jinja/
-Provides-Extra: i18n
 
-# Jinja
+# MarkupSafe
 
-Jinja is a fast, expressive, extensible templating engine. Special
-placeholders in the template allow writing code similar to Python
-syntax. Then the template is passed data to render the final document.
-
-It includes:
-
--   Template inheritance and inclusion.
--   Define and import macros within templates.
--   HTML templates can use autoescaping to prevent XSS from untrusted
-    user input.
--   A sandboxed environment can safely render untrusted templates.
--   AsyncIO support for generating templates and calling async
-    functions.
--   I18N support with Babel.
--   Templates are compiled to optimized Python code just-in-time and
-    cached, or can be compiled ahead-of-time.
--   Exceptions point to the correct line in templates to make debugging
-    easier.
--   Extensible filters, tests, functions, and even syntax.
-
-Jinja's philosophy is that while application logic belongs in Python if
-possible, it shouldn't make the template designer's job difficult by
-restricting functionality too much.
+MarkupSafe implements a text object that escapes characters so it is
+safe to use in HTML and XML. Characters that have special meanings are
+replaced so that they display as the actual characters. This mitigates
+injection attacks, meaning untrusted user input can safely be displayed
+on a page.
 
 
-## In A Nutshell
+## Examples
 
-```jinja
-{% extends "base.html" %}
-{% block title %}Members{% endblock %}
-{% block content %}
-  <ul>
-  {% for user in users %}
-    <li><a href="{{ user.url }}">{{ user.username }}</a></li>
-  {% endfor %}
-  </ul>
-{% endblock %}
+```pycon
+>>> from markupsafe import Markup, escape
+
+>>> # escape replaces special characters and wraps in Markup
+>>> escape("<script>alert(document.cookie);</script>")
+Markup('&lt;script&gt;alert(document.cookie);&lt;/script&gt;')
+
+>>> # wrap in Markup to mark text "safe" and prevent escaping
+>>> Markup("<strong>Hello</strong>")
+Markup('<strong>hello</strong>')
+
+>>> escape(Markup("<strong>Hello</strong>"))
+Markup('<strong>hello</strong>')
+
+>>> # Markup is a str subclass
+>>> # methods and operators escape their arguments
+>>> template = Markup("Hello <em>{name}</em>")
+>>> template.format(name='"World"')
+Markup('Hello <em>&#34;World&#34;</em>')
 ```
 
 ## Donate
 
-The Pallets organization develops and supports Jinja and other popular
-packages. In order to grow the community of contributors and users, and
-allow the maintainers to devote more time to the projects, [please
-donate today][].
+The Pallets organization develops and supports MarkupSafe and other
+popular packages. In order to grow the community of contributors and
+users, and allow the maintainers to devote more time to the projects,
+[please donate today][].
 
 [please donate today]: https://palletsprojects.com/donate
-
-## Contributing
-
-See our [detailed contributing documentation][contrib] for many ways to
-contribute, including reporting issues, requesting features, asking or answering
-questions, and making PRs.
-
-[contrib]: https://palletsprojects.com/contributing/
-
