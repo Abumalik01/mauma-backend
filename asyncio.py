@@ -1,4 +1,4 @@
-# connectors/asyncio.py
+# testing/asyncio.py
 # Copyright (C) 2005-2025 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
@@ -6,208 +6,130 @@
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
 # mypy: ignore-errors
 
-"""generic asyncio-adapted versions of DBAPI connection and cursor"""
+
+# functions and wrappers to run tests, fixtures, provisioning and
+# setup/teardown in an asyncio event loop, conditionally based on the
+# current DB driver being used for a test.
+
+# note that SQLAlchemy's asyncio integration also supports a method
+# of running individual asyncio functions inside of separate event loops
+# using "async_fallback" mode; however running whole functions in the event
+# loop is a more accurate test for how SQLAlchemy's asyncio features
+# would run in the real world.
+
 
 from __future__ import annotations
 
-import collections
+from functools import wraps
+import inspect
 
-from ..engine import AdaptedConnection
-from ..util.concurrency import asyncio
-from ..util.concurrency import await_fallback
-from ..util.concurrency import await_only
+from . import config
+from ..util.concurrency import _AsyncUtil
 
-
-class AsyncAdapt_dbapi_cursor:
-    server_side = False
-    __slots__ = (
-        "_adapt_connection",
-        "_connection",
-        "await_",
-        "_cursor",
-        "_rows",
-    )
-
-    def __init__(self, adapt_connection):
-        self._adapt_connection = adapt_connection
-        self._connection = adapt_connection._connection
-        self.await_ = adapt_connection.await_
-
-        cursor = self._connection.cursor()
-        self._cursor = self._aenter_cursor(cursor)
-
-        if not self.server_side:
-            self._rows = collections.deque()
-
-    def _aenter_cursor(self, cursor):
-        return self.await_(cursor.__aenter__())
-
-    @property
-    def description(self):
-        return self._cursor.description
-
-    @property
-    def rowcount(self):
-        return self._cursor.rowcount
-
-    @property
-    def arraysize(self):
-        return self._cursor.arraysize
-
-    @arraysize.setter
-    def arraysize(self, value):
-        self._cursor.arraysize = value
-
-    @property
-    def lastrowid(self):
-        return self._cursor.lastrowid
-
-    def close(self):
-        # note we aren't actually closing the cursor here,
-        # we are just letting GC do it.  see notes in aiomysql dialect
-        self._rows.clear()
-
-    def execute(self, operation, parameters=None):
-        return self.await_(self._execute_async(operation, parameters))
-
-    def executemany(self, operation, seq_of_parameters):
-        return self.await_(
-            self._executemany_async(operation, seq_of_parameters)
-        )
-
-    async def _execute_async(self, operation, parameters):
-        async with self._adapt_connection._execute_mutex:
-            result = await self._cursor.execute(operation, parameters or ())
-
-            if self._cursor.description and not self.server_side:
-                self._rows = collections.deque(await self._cursor.fetchall())
-            return result
-
-    async def _executemany_async(self, operation, seq_of_parameters):
-        async with self._adapt_connection._execute_mutex:
-            return await self._cursor.executemany(operation, seq_of_parameters)
-
-    def nextset(self):
-        self.await_(self._cursor.nextset())
-        if self._cursor.description and not self.server_side:
-            self._rows = collections.deque(
-                self.await_(self._cursor.fetchall())
-            )
-
-    def setinputsizes(self, *inputsizes):
-        # NOTE: this is overrridden in aioodbc due to
-        # see https://github.com/aio-libs/aioodbc/issues/451
-        # right now
-
-        return self.await_(self._cursor.setinputsizes(*inputsizes))
-
-    def __iter__(self):
-        while self._rows:
-            yield self._rows.popleft()
-
-    def fetchone(self):
-        if self._rows:
-            return self._rows.popleft()
-        else:
-            return None
-
-    def fetchmany(self, size=None):
-        if size is None:
-            size = self.arraysize
-        rr = self._rows
-        return [rr.popleft() for _ in range(min(size, len(rr)))]
-
-    def fetchall(self):
-        retval = list(self._rows)
-        self._rows.clear()
-        return retval
+# may be set to False if the
+# --disable-asyncio flag is passed to the test runner.
+ENABLE_ASYNCIO = True
+_async_util = _AsyncUtil()  # it has lazy init so just always create one
 
 
-class AsyncAdapt_dbapi_ss_cursor(AsyncAdapt_dbapi_cursor):
-    __slots__ = ()
-    server_side = True
+def _shutdown():
+    """called when the test finishes"""
+    _async_util.close()
 
-    def __init__(self, adapt_connection):
-        self._adapt_connection = adapt_connection
-        self._connection = adapt_connection._connection
-        self.await_ = adapt_connection.await_
 
-        cursor = self._connection.cursor()
+def _run_coroutine_function(fn, *args, **kwargs):
+    return _async_util.run(fn, *args, **kwargs)
 
-        self._cursor = self.await_(cursor.__aenter__())
 
-    def close(self):
-        if self._cursor is not None:
-            self.await_(self._cursor.close())
-            self._cursor = None
+def _assume_async(fn, *args, **kwargs):
+    """Run a function in an asyncio loop unconditionally.
 
-    def fetchone(self):
-        return self.await_(self._cursor.fetchone())
+    This function is used for provisioning features like
+    testing a database connection for server info.
 
-    def fetchmany(self, size=None):
-        return self.await_(self._cursor.fetchmany(size=size))
+    Note that for blocking IO database drivers, this means they block the
+    event loop.
 
-    def fetchall(self):
-        return self.await_(self._cursor.fetchall())
+    """
 
-    def __iter__(self):
-        iterator = self._cursor.__aiter__()
-        while True:
+    if not ENABLE_ASYNCIO:
+        return fn(*args, **kwargs)
+
+    return _async_util.run_in_greenlet(fn, *args, **kwargs)
+
+
+def _maybe_async_provisioning(fn, *args, **kwargs):
+    """Run a function in an asyncio loop if any current drivers might need it.
+
+    This function is used for provisioning features that take
+    place outside of a specific database driver being selected, so if the
+    current driver that happens to be used for the provisioning operation
+    is an async driver, it will run in asyncio and not fail.
+
+    Note that for blocking IO database drivers, this means they block the
+    event loop.
+
+    """
+    if not ENABLE_ASYNCIO:
+        return fn(*args, **kwargs)
+
+    if config.any_async:
+        return _async_util.run_in_greenlet(fn, *args, **kwargs)
+    else:
+        return fn(*args, **kwargs)
+
+
+def _maybe_async(fn, *args, **kwargs):
+    """Run a function in an asyncio loop if the current selected driver is
+    async.
+
+    This function is used for test setup/teardown and tests themselves
+    where the current DB driver is known.
+
+
+    """
+    if not ENABLE_ASYNCIO:
+        return fn(*args, **kwargs)
+
+    is_async = config._current.is_async
+
+    if is_async:
+        return _async_util.run_in_greenlet(fn, *args, **kwargs)
+    else:
+        return fn(*args, **kwargs)
+
+
+def _maybe_async_wrapper(fn):
+    """Apply the _maybe_async function to an existing function and return
+    as a wrapped callable, supporting generator functions as well.
+
+    This is currently used for pytest fixtures that support generator use.
+
+    """
+
+    if inspect.isgeneratorfunction(fn):
+        _stop = object()
+
+        def call_next(gen):
             try:
-                yield self.await_(iterator.__anext__())
-            except StopAsyncIteration:
-                break
+                return next(gen)
+                # can't raise StopIteration in an awaitable.
+            except StopIteration:
+                return _stop
 
+        @wraps(fn)
+        def wrap_fixture(*args, **kwargs):
+            gen = fn(*args, **kwargs)
+            while True:
+                value = _maybe_async(call_next, gen)
+                if value is _stop:
+                    break
+                yield value
 
-class AsyncAdapt_dbapi_connection(AdaptedConnection):
-    _cursor_cls = AsyncAdapt_dbapi_cursor
-    _ss_cursor_cls = AsyncAdapt_dbapi_ss_cursor
+    else:
 
-    await_ = staticmethod(await_only)
-    __slots__ = ("dbapi", "_execute_mutex")
+        @wraps(fn)
+        def wrap_fixture(*args, **kwargs):
+            return _maybe_async(fn, *args, **kwargs)
 
-    def __init__(self, dbapi, connection):
-        self.dbapi = dbapi
-        self._connection = connection
-        self._execute_mutex = asyncio.Lock()
-
-    def ping(self, reconnect):
-        return self.await_(self._connection.ping(reconnect))
-
-    def add_output_converter(self, *arg, **kw):
-        self._connection.add_output_converter(*arg, **kw)
-
-    def character_set_name(self):
-        return self._connection.character_set_name()
-
-    @property
-    def autocommit(self):
-        return self._connection.autocommit
-
-    @autocommit.setter
-    def autocommit(self, value):
-        # https://github.com/aio-libs/aioodbc/issues/448
-        # self._connection.autocommit = value
-
-        self._connection._conn.autocommit = value
-
-    def cursor(self, server_side=False):
-        if server_side:
-            return self._ss_cursor_cls(self)
-        else:
-            return self._cursor_cls(self)
-
-    def rollback(self):
-        self.await_(self._connection.rollback())
-
-    def commit(self):
-        self.await_(self._connection.commit())
-
-    def close(self):
-        self.await_(self._connection.close())
-
-
-class AsyncAdaptFallback_dbapi_connection(AsyncAdapt_dbapi_connection):
-    __slots__ = ()
-
-    await_ = staticmethod(await_fallback)
+    return wrap_fixture
