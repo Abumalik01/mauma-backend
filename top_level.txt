@@ -1,1 +1,4 @@
-pip
+_distutils_hack
+debian
+pkg_resources
+setuptools
