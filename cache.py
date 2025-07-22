@@ -1,264 +1,223 @@
-"""Cache Management
-"""
-
-import hashlib
-import json
-import logging
 import os
-from typing import Any, Dict, List, Optional, Set
+import textwrap
+from optparse import Values
+from typing import Any, List
 
-from pip._vendor.packaging.tags import Tag, interpreter_name, interpreter_version
-from pip._vendor.packaging.utils import canonicalize_name
+import pip._internal.utils.filesystem as filesystem
+from pip._internal.cli.base_command import Command
+from pip._internal.cli.status_codes import ERROR, SUCCESS
+from pip._internal.exceptions import CommandError, PipError
+from pip._internal.utils.logging import getLogger
 
-from pip._internal.exceptions import InvalidWheelFilename
-from pip._internal.models.format_control import FormatControl
-from pip._internal.models.link import Link
-from pip._internal.models.wheel import Wheel
-from pip._internal.utils.temp_dir import TempDirectory, tempdir_kinds
-from pip._internal.utils.urls import path_to_url
-
-logger = logging.getLogger(__name__)
+logger = getLogger(__name__)
 
 
-def _hash_dict(d: Dict[str, str]) -> str:
-    """Return a stable sha224 of a dictionary."""
-    s = json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha224(s.encode("ascii")).hexdigest()
+class CacheCommand(Command):
+    """
+    Inspect and manage pip's wheel cache.
 
+    Subcommands:
 
-class Cache:
-    """An abstract class - provides cache directories for data from links
+    - dir: Show the cache directory.
+    - info: Show information about the cache.
+    - list: List filenames of packages stored in the cache.
+    - remove: Remove one or more package from the cache.
+    - purge: Remove all items from the cache.
 
-
-    :param cache_dir: The root of the cache.
-    :param format_control: An object of FormatControl class to limit
-        binaries being read from the cache.
-    :param allowed_formats: which formats of files the cache should store.
-        ('binary' and 'source' are the only allowed values)
+    ``<pattern>`` can be a glob expression or a package name.
     """
 
-    def __init__(
-        self, cache_dir: str, format_control: FormatControl, allowed_formats: Set[str]
-    ) -> None:
-        super().__init__()
-        assert not cache_dir or os.path.isabs(cache_dir)
-        self.cache_dir = cache_dir or None
-        self.format_control = format_control
-        self.allowed_formats = allowed_formats
+    ignore_require_venv = True
+    usage = """
+        %prog dir
+        %prog info
+        %prog list [<pattern>] [--format=[human, abspath]]
+        %prog remove <pattern>
+        %prog purge
+    """
 
-        _valid_formats = {"source", "binary"}
-        assert self.allowed_formats.union(_valid_formats) == _valid_formats
+    def add_options(self) -> None:
 
-    def _get_cache_path_parts(self, link: Link) -> List[str]:
-        """Get parts of part that must be os.path.joined with cache_dir"""
+        self.cmd_opts.add_option(
+            "--format",
+            action="store",
+            dest="list_format",
+            default="human",
+            choices=("human", "abspath"),
+            help="Select the output format among: human (default) or abspath",
+        )
 
-        # We want to generate an url to use as our cache key, we don't want to
-        # just re-use the URL because it might have other items in the fragment
-        # and we don't care about those.
-        key_parts = {"url": link.url_without_fragment}
-        if link.hash_name is not None and link.hash is not None:
-            key_parts[link.hash_name] = link.hash
-        if link.subdirectory_fragment:
-            key_parts["subdirectory"] = link.subdirectory_fragment
+        self.parser.insert_option_group(0, self.cmd_opts)
 
-        # Include interpreter name, major and minor version in cache key
-        # to cope with ill-behaved sdists that build a different wheel
-        # depending on the python version their setup.py is being run on,
-        # and don't encode the difference in compatibility tags.
-        # https://github.com/pypa/pip/issues/7296
-        key_parts["interpreter_name"] = interpreter_name()
-        key_parts["interpreter_version"] = interpreter_version()
+    def run(self, options: Values, args: List[str]) -> int:
+        handlers = {
+            "dir": self.get_cache_dir,
+            "info": self.get_cache_info,
+            "list": self.list_cache_items,
+            "remove": self.remove_cache_items,
+            "purge": self.purge_cache,
+        }
 
-        # Encode our key url with sha224, we'll use this because it has similar
-        # security properties to sha256, but with a shorter total output (and
-        # thus less secure). However the differences don't make a lot of
-        # difference for our use case here.
-        hashed = _hash_dict(key_parts)
+        if not options.cache_dir:
+            logger.error("pip cache commands can not function since cache is disabled.")
+            return ERROR
 
-        # We want to nest the directories some to prevent having a ton of top
-        # level directories where we might run out of sub directories on some
-        # FS.
-        parts = [hashed[:2], hashed[2:4], hashed[4:6], hashed[6:]]
-
-        return parts
-
-    def _get_candidates(self, link: Link, canonical_package_name: str) -> List[Any]:
-        can_not_cache = not self.cache_dir or not canonical_package_name or not link
-        if can_not_cache:
-            return []
-
-        formats = self.format_control.get_allowed_formats(canonical_package_name)
-        if not self.allowed_formats.intersection(formats):
-            return []
-
-        candidates = []
-        path = self.get_path_for_link(link)
-        if os.path.isdir(path):
-            for candidate in os.listdir(path):
-                candidates.append((candidate, path))
-        return candidates
-
-    def get_path_for_link(self, link: Link) -> str:
-        """Return a directory to store cached items in for link."""
-        raise NotImplementedError()
-
-    def get(
-        self,
-        link: Link,
-        package_name: Optional[str],
-        supported_tags: List[Tag],
-    ) -> Link:
-        """Returns a link to a cached item if it exists, otherwise returns the
-        passed link.
-        """
-        raise NotImplementedError()
-
-
-class SimpleWheelCache(Cache):
-    """A cache of wheels for future installs."""
-
-    def __init__(self, cache_dir: str, format_control: FormatControl) -> None:
-        super().__init__(cache_dir, format_control, {"binary"})
-
-    def get_path_for_link(self, link: Link) -> str:
-        """Return a directory to store cached wheels for link
-
-        Because there are M wheels for any one sdist, we provide a directory
-        to cache them in, and then consult that directory when looking up
-        cache hits.
-
-        We only insert things into the cache if they have plausible version
-        numbers, so that we don't contaminate the cache with things that were
-        not unique. E.g. ./package might have dozens of installs done for it
-        and build a version of 0.0...and if we built and cached a wheel, we'd
-        end up using the same wheel even if the source has been edited.
-
-        :param link: The link of the sdist for which this will cache wheels.
-        """
-        parts = self._get_cache_path_parts(link)
-        assert self.cache_dir
-        # Store wheels within the root cache_dir
-        return os.path.join(self.cache_dir, "wheels", *parts)
-
-    def get(
-        self,
-        link: Link,
-        package_name: Optional[str],
-        supported_tags: List[Tag],
-    ) -> Link:
-        candidates = []
-
-        if not package_name:
-            return link
-
-        canonical_package_name = canonicalize_name(package_name)
-        for wheel_name, wheel_dir in self._get_candidates(link, canonical_package_name):
-            try:
-                wheel = Wheel(wheel_name)
-            except InvalidWheelFilename:
-                continue
-            if canonicalize_name(wheel.name) != canonical_package_name:
-                logger.debug(
-                    "Ignoring cached wheel %s for %s as it "
-                    "does not match the expected distribution name %s.",
-                    wheel_name,
-                    link,
-                    package_name,
-                )
-                continue
-            if not wheel.supported(supported_tags):
-                # Built for a different python/arch/etc
-                continue
-            candidates.append(
-                (
-                    wheel.support_index_min(supported_tags),
-                    wheel_name,
-                    wheel_dir,
-                )
+        # Determine action
+        if not args or args[0] not in handlers:
+            logger.error(
+                "Need an action (%s) to perform.",
+                ", ".join(sorted(handlers)),
             )
+            return ERROR
 
-        if not candidates:
-            return link
+        action = args[0]
 
-        _, wheel_name, wheel_dir = min(candidates)
-        return Link(path_to_url(os.path.join(wheel_dir, wheel_name)))
+        # Error handling happens here, not in the action-handlers.
+        try:
+            handlers[action](options, args[1:])
+        except PipError as e:
+            logger.error(e.args[0])
+            return ERROR
 
+        return SUCCESS
 
-class EphemWheelCache(SimpleWheelCache):
-    """A SimpleWheelCache that creates it's own temporary cache directory"""
+    def get_cache_dir(self, options: Values, args: List[Any]) -> None:
+        if args:
+            raise CommandError("Too many arguments")
 
-    def __init__(self, format_control: FormatControl) -> None:
-        self._temp_dir = TempDirectory(
-            kind=tempdir_kinds.EPHEM_WHEEL_CACHE,
-            globally_managed=True,
+        logger.info(options.cache_dir)
+
+    def get_cache_info(self, options: Values, args: List[Any]) -> None:
+        if args:
+            raise CommandError("Too many arguments")
+
+        num_http_files = len(self._find_http_files(options))
+        num_packages = len(self._find_wheels(options, "*"))
+
+        http_cache_location = self._cache_dir(options, "http")
+        wheels_cache_location = self._cache_dir(options, "wheels")
+        http_cache_size = filesystem.format_directory_size(http_cache_location)
+        wheels_cache_size = filesystem.format_directory_size(wheels_cache_location)
+
+        message = (
+            textwrap.dedent(
+                """
+                    Package index page cache location: {http_cache_location}
+                    Package index page cache size: {http_cache_size}
+                    Number of HTTP files: {num_http_files}
+                    Wheels location: {wheels_cache_location}
+                    Wheels size: {wheels_cache_size}
+                    Number of wheels: {package_count}
+                """
+            )
+            .format(
+                http_cache_location=http_cache_location,
+                http_cache_size=http_cache_size,
+                num_http_files=num_http_files,
+                wheels_cache_location=wheels_cache_location,
+                package_count=num_packages,
+                wheels_cache_size=wheels_cache_size,
+            )
+            .strip()
         )
 
-        super().__init__(self._temp_dir.path, format_control)
+        logger.info(message)
 
+    def list_cache_items(self, options: Values, args: List[Any]) -> None:
+        if len(args) > 1:
+            raise CommandError("Too many arguments")
 
-class CacheEntry:
-    def __init__(
-        self,
-        link: Link,
-        persistent: bool,
-    ):
-        self.link = link
-        self.persistent = persistent
+        if args:
+            pattern = args[0]
+        else:
+            pattern = "*"
 
+        files = self._find_wheels(options, pattern)
+        if options.list_format == "human":
+            self.format_for_human(files)
+        else:
+            self.format_for_abspath(files)
 
-class WheelCache(Cache):
-    """Wraps EphemWheelCache and SimpleWheelCache into a single Cache
+    def format_for_human(self, files: List[str]) -> None:
+        if not files:
+            logger.info("Nothing cached.")
+            return
 
-    This Cache allows for gracefully degradation, using the ephem wheel cache
-    when a certain link is not found in the simple wheel cache first.
-    """
+        results = []
+        for filename in files:
+            wheel = os.path.basename(filename)
+            size = filesystem.format_file_size(filename)
+            results.append(f" - {wheel} ({size})")
+        logger.info("Cache contents:\n")
+        logger.info("\n".join(sorted(results)))
 
-    def __init__(self, cache_dir: str, format_control: FormatControl) -> None:
-        super().__init__(cache_dir, format_control, {"binary"})
-        self._wheel_cache = SimpleWheelCache(cache_dir, format_control)
-        self._ephem_cache = EphemWheelCache(format_control)
+    def format_for_abspath(self, files: List[str]) -> None:
+        if not files:
+            return
 
-    def get_path_for_link(self, link: Link) -> str:
-        return self._wheel_cache.get_path_for_link(link)
+        results = []
+        for filename in files:
+            results.append(filename)
 
-    def get_ephem_path_for_link(self, link: Link) -> str:
-        return self._ephem_cache.get_path_for_link(link)
+        logger.info("\n".join(sorted(results)))
 
-    def get(
-        self,
-        link: Link,
-        package_name: Optional[str],
-        supported_tags: List[Tag],
-    ) -> Link:
-        cache_entry = self.get_cache_entry(link, package_name, supported_tags)
-        if cache_entry is None:
-            return link
-        return cache_entry.link
+    def remove_cache_items(self, options: Values, args: List[Any]) -> None:
+        if len(args) > 1:
+            raise CommandError("Too many arguments")
 
-    def get_cache_entry(
-        self,
-        link: Link,
-        package_name: Optional[str],
-        supported_tags: List[Tag],
-    ) -> Optional[CacheEntry]:
-        """Returns a CacheEntry with a link to a cached item if it exists or
-        None. The cache entry indicates if the item was found in the persistent
-        or ephemeral cache.
-        """
-        retval = self._wheel_cache.get(
-            link=link,
-            package_name=package_name,
-            supported_tags=supported_tags,
-        )
-        if retval is not link:
-            return CacheEntry(retval, persistent=True)
+        if not args:
+            raise CommandError("Please provide a pattern")
 
-        retval = self._ephem_cache.get(
-            link=link,
-            package_name=package_name,
-            supported_tags=supported_tags,
-        )
-        if retval is not link:
-            return CacheEntry(retval, persistent=False)
+        files = self._find_wheels(options, args[0])
 
-        return None
+        no_matching_msg = "No matching packages"
+        if args[0] == "*":
+            # Only fetch http files if no specific pattern given
+            files += self._find_http_files(options)
+        else:
+            # Add the pattern to the log message
+            no_matching_msg += ' for pattern "{}"'.format(args[0])
+
+        if not files:
+            logger.warning(no_matching_msg)
+
+        for filename in files:
+            os.unlink(filename)
+            logger.verbose("Removed %s", filename)
+        logger.info("Files removed: %s", len(files))
+
+    def purge_cache(self, options: Values, args: List[Any]) -> None:
+        if args:
+            raise CommandError("Too many arguments")
+
+        return self.remove_cache_items(options, ["*"])
+
+    def _cache_dir(self, options: Values, subdir: str) -> str:
+        return os.path.join(options.cache_dir, subdir)
+
+    def _find_http_files(self, options: Values) -> List[str]:
+        http_dir = self._cache_dir(options, "http")
+        return filesystem.find_files(http_dir, "*")
+
+    def _find_wheels(self, options: Values, pattern: str) -> List[str]:
+        wheel_dir = self._cache_dir(options, "wheels")
+
+        # The wheel filename format, as specified in PEP 427, is:
+        #     {distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl
+        #
+        # Additionally, non-alphanumeric values in the distribution are
+        # normalized to underscores (_), meaning hyphens can never occur
+        # before `-{version}`.
+        #
+        # Given that information:
+        # - If the pattern we're given contains a hyphen (-), the user is
+        #   providing at least the version. Thus, we can just append `*.whl`
+        #   to match the rest of it.
+        # - If the pattern we're given doesn't contain a hyphen (-), the
+        #   user is only providing the name. Thus, we append `-*.whl` to
+        #   match the hyphen before the version, followed by anything else.
+        #
+        # PEP 427: https://www.python.org/dev/peps/pep-0427/
+        pattern = pattern + ("*.whl" if "-" in pattern else "-*.whl")
+
+        return filesystem.find_files(wheel_dir, pattern)
