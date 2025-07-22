@@ -1,120 +1,246 @@
-"""Legacy installation process, i.e. `setup.py install`.
+# event/legacy.py
+# Copyright (C) 2005-2025 the SQLAlchemy authors and contributors
+# <see AUTHORS file>
+#
+# This module is part of SQLAlchemy and is released under
+# the MIT License: https://www.opensource.org/licenses/mit-license.php
+
+"""Routines to handle adaption of legacy call signatures,
+generation of deprecation notes and docstrings.
+
 """
+from __future__ import annotations
 
-import logging
-import os
-from distutils.util import change_root
-from typing import List, Optional, Sequence
+import typing
+from typing import Any
+from typing import Callable
+from typing import List
+from typing import Optional
+from typing import Tuple
+from typing import Type
 
-from pip._internal.build_env import BuildEnvironment
-from pip._internal.exceptions import InstallationError, LegacyInstallFailure
-from pip._internal.models.scheme import Scheme
-from pip._internal.utils.misc import ensure_dir
-from pip._internal.utils.setuptools_build import make_setuptools_install_args
-from pip._internal.utils.subprocess import runner_with_spinner_message
-from pip._internal.utils.temp_dir import TempDirectory
+from .registry import _ET
+from .registry import _ListenerFnType
+from .. import util
+from ..util.compat import FullArgSpec
 
-logger = logging.getLogger(__name__)
+if typing.TYPE_CHECKING:
+    from .attr import _ClsLevelDispatch
+    from .base import _HasEventsDispatch
 
 
-def write_installed_files_from_setuptools_record(
-    record_lines: List[str],
-    root: Optional[str],
-    req_description: str,
-) -> None:
-    def prepend_root(path: str) -> str:
-        if root is None or not os.path.isabs(path):
-            return path
+_LegacySignatureType = Tuple[str, List[str], Optional[Callable[..., Any]]]
+
+
+def _legacy_signature(
+    since: str,
+    argnames: List[str],
+    converter: Optional[Callable[..., Any]] = None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """legacy sig decorator
+
+
+    :param since: string version for deprecation warning
+    :param argnames: list of strings, which is *all* arguments that the legacy
+     version accepted, including arguments that are still there
+    :param converter: lambda that will accept tuple of this full arg signature
+     and return tuple of new arg signature.
+
+    """
+
+    def leg(fn: Callable[..., Any]) -> Callable[..., Any]:
+        if not hasattr(fn, "_legacy_signatures"):
+            fn._legacy_signatures = []  # type: ignore[attr-defined]
+        fn._legacy_signatures.append((since, argnames, converter))  # type: ignore[attr-defined] # noqa: E501
+        return fn
+
+    return leg
+
+
+def _wrap_fn_for_legacy(
+    dispatch_collection: _ClsLevelDispatch[_ET],
+    fn: _ListenerFnType,
+    argspec: FullArgSpec,
+) -> _ListenerFnType:
+    for since, argnames, conv in dispatch_collection.legacy_signatures:
+        if argnames[-1] == "**kw":
+            has_kw = True
+            argnames = argnames[0:-1]
         else:
-            return change_root(root, path)
+            has_kw = False
 
-    for line in record_lines:
-        directory = os.path.dirname(line)
-        if directory.endswith(".egg-info"):
-            egg_info_dir = prepend_root(directory)
-            break
-    else:
-        message = (
-            "{} did not indicate that it installed an "
-            ".egg-info directory. Only setup.py projects "
-            "generating .egg-info directories are supported."
-        ).format(req_description)
-        raise InstallationError(message)
-
-    new_lines = []
-    for line in record_lines:
-        filename = line.strip()
-        if os.path.isdir(filename):
-            filename += os.path.sep
-        new_lines.append(os.path.relpath(prepend_root(filename), egg_info_dir))
-    new_lines.sort()
-    ensure_dir(egg_info_dir)
-    inst_files_path = os.path.join(egg_info_dir, "installed-files.txt")
-    with open(inst_files_path, "w") as f:
-        f.write("\n".join(new_lines) + "\n")
-
-
-def install(
-    install_options: List[str],
-    global_options: Sequence[str],
-    root: Optional[str],
-    home: Optional[str],
-    prefix: Optional[str],
-    use_user_site: bool,
-    pycompile: bool,
-    scheme: Scheme,
-    setup_py_path: str,
-    isolated: bool,
-    req_name: str,
-    build_env: BuildEnvironment,
-    unpacked_source_directory: str,
-    req_description: str,
-) -> bool:
-
-    header_dir = scheme.headers
-
-    with TempDirectory(kind="record") as temp_dir:
-        try:
-            record_filename = os.path.join(temp_dir.path, "install-record.txt")
-            install_args = make_setuptools_install_args(
-                setup_py_path,
-                global_options=global_options,
-                install_options=install_options,
-                record_filename=record_filename,
-                root=root,
-                prefix=prefix,
-                header_dir=header_dir,
-                home=home,
-                use_user_site=use_user_site,
-                no_user_config=isolated,
-                pycompile=pycompile,
+        if len(argnames) == len(argspec.args) and has_kw is bool(
+            argspec.varkw
+        ):
+            formatted_def = "def %s(%s%s)" % (
+                dispatch_collection.name,
+                ", ".join(dispatch_collection.arg_names),
+                ", **kw" if has_kw else "",
             )
-
-            runner = runner_with_spinner_message(
-                f"Running setup.py install for {req_name}"
-            )
-            with build_env:
-                runner(
-                    cmd=install_args,
-                    cwd=unpacked_source_directory,
+            warning_txt = (
+                'The argument signature for the "%s.%s" event listener '
+                "has changed as of version %s, and conversion for "
+                "the old argument signature will be removed in a "
+                'future release.  The new signature is "%s"'
+                % (
+                    dispatch_collection.clsname,
+                    dispatch_collection.name,
+                    since,
+                    formatted_def,
                 )
+            )
 
-            if not os.path.exists(record_filename):
-                logger.debug("Record file %s not found", record_filename)
-                # Signal to the caller that we didn't install the new package
-                return False
+            if conv is not None:
+                assert not has_kw
 
-        except Exception as e:
-            # Signal to the caller that we didn't install the new package
-            raise LegacyInstallFailure(package_details=req_name) from e
+                def wrap_leg(*args: Any, **kw: Any) -> Any:
+                    util.warn_deprecated(warning_txt, version=since)
+                    assert conv is not None
+                    return fn(*conv(*args))
 
-        # At this point, we have successfully installed the requirement.
+            else:
 
-        # We intentionally do not use any encoding to read the file because
-        # setuptools writes the file using distutils.file_util.write_file,
-        # which does not specify an encoding.
-        with open(record_filename) as f:
-            record_lines = f.read().splitlines()
+                def wrap_leg(*args: Any, **kw: Any) -> Any:
+                    util.warn_deprecated(warning_txt, version=since)
+                    argdict = dict(zip(dispatch_collection.arg_names, args))
+                    args_from_dict = [argdict[name] for name in argnames]
+                    if has_kw:
+                        return fn(*args_from_dict, **kw)
+                    else:
+                        return fn(*args_from_dict)
 
-    write_installed_files_from_setuptools_record(record_lines, root, req_description)
-    return True
+            return wrap_leg
+    else:
+        return fn
+
+
+def _indent(text: str, indent: str) -> str:
+    return "\n".join(indent + line for line in text.split("\n"))
+
+
+def _standard_listen_example(
+    dispatch_collection: _ClsLevelDispatch[_ET],
+    sample_target: Any,
+    fn: _ListenerFnType,
+) -> str:
+    example_kw_arg = _indent(
+        "\n".join(
+            "%(arg)s = kw['%(arg)s']" % {"arg": arg}
+            for arg in dispatch_collection.arg_names[0:2]
+        ),
+        "    ",
+    )
+    if dispatch_collection.legacy_signatures:
+        current_since = max(
+            since
+            for since, args, conv in dispatch_collection.legacy_signatures
+        )
+    else:
+        current_since = None
+    text = (
+        "from sqlalchemy import event\n\n\n"
+        "@event.listens_for(%(sample_target)s, '%(event_name)s')\n"
+        "def receive_%(event_name)s("
+        "%(named_event_arguments)s%(has_kw_arguments)s):\n"
+        "    \"listen for the '%(event_name)s' event\"\n"
+        "\n    # ... (event handling logic) ...\n"
+    )
+
+    text %= {
+        "current_since": (
+            " (arguments as of %s)" % current_since if current_since else ""
+        ),
+        "event_name": fn.__name__,
+        "has_kw_arguments": ", **kw" if dispatch_collection.has_kw else "",
+        "named_event_arguments": ", ".join(dispatch_collection.arg_names),
+        "example_kw_arg": example_kw_arg,
+        "sample_target": sample_target,
+    }
+    return text
+
+
+def _legacy_listen_examples(
+    dispatch_collection: _ClsLevelDispatch[_ET],
+    sample_target: str,
+    fn: _ListenerFnType,
+) -> str:
+    text = ""
+    for since, args, conv in dispatch_collection.legacy_signatures:
+        text += (
+            "\n# DEPRECATED calling style (pre-%(since)s, "
+            "will be removed in a future release)\n"
+            "@event.listens_for(%(sample_target)s, '%(event_name)s')\n"
+            "def receive_%(event_name)s("
+            "%(named_event_arguments)s%(has_kw_arguments)s):\n"
+            "    \"listen for the '%(event_name)s' event\"\n"
+            "\n    # ... (event handling logic) ...\n"
+            % {
+                "since": since,
+                "event_name": fn.__name__,
+                "has_kw_arguments": (
+                    " **kw" if dispatch_collection.has_kw else ""
+                ),
+                "named_event_arguments": ", ".join(args),
+                "sample_target": sample_target,
+            }
+        )
+    return text
+
+
+def _version_signature_changes(
+    parent_dispatch_cls: Type[_HasEventsDispatch[_ET]],
+    dispatch_collection: _ClsLevelDispatch[_ET],
+) -> str:
+    since, args, conv = dispatch_collection.legacy_signatures[0]
+    return (
+        "\n.. versionchanged:: %(since)s\n"
+        "    The :meth:`.%(clsname)s.%(event_name)s` event now accepts the \n"
+        "    arguments %(named_event_arguments)s%(has_kw_arguments)s.\n"
+        "    Support for listener functions which accept the previous \n"
+        '    argument signature(s) listed above as "deprecated" will be \n'
+        "    removed in a future release."
+        % {
+            "since": since,
+            "clsname": parent_dispatch_cls.__name__,
+            "event_name": dispatch_collection.name,
+            "named_event_arguments": ", ".join(
+                ":paramref:`.%(clsname)s.%(event_name)s.%(param_name)s`"
+                % {
+                    "clsname": parent_dispatch_cls.__name__,
+                    "event_name": dispatch_collection.name,
+                    "param_name": param_name,
+                }
+                for param_name in dispatch_collection.arg_names
+            ),
+            "has_kw_arguments": ", **kw" if dispatch_collection.has_kw else "",
+        }
+    )
+
+
+def _augment_fn_docs(
+    dispatch_collection: _ClsLevelDispatch[_ET],
+    parent_dispatch_cls: Type[_HasEventsDispatch[_ET]],
+    fn: _ListenerFnType,
+) -> str:
+    header = (
+        ".. container:: event_signatures\n\n"
+        "     Example argument forms::\n"
+        "\n"
+    )
+
+    sample_target = getattr(parent_dispatch_cls, "_target_class_doc", "obj")
+    text = header + _indent(
+        _standard_listen_example(dispatch_collection, sample_target, fn),
+        " " * 8,
+    )
+    if dispatch_collection.legacy_signatures:
+        text += _indent(
+            _legacy_listen_examples(dispatch_collection, sample_target, fn),
+            " " * 8,
+        )
+
+        text += _version_signature_changes(
+            parent_dispatch_cls, dispatch_collection
+        )
+
+    return util.inject_docstring_text(fn.__doc__, text, 1)
