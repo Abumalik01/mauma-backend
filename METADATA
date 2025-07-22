@@ -1,109 +1,89 @@
-Metadata-Version: 2.1
-Name: Flask-SQLAlchemy
+Metadata-Version: 2.4
+Name: Flask
 Version: 3.1.1
-Summary: Add SQLAlchemy support to your Flask application.
+Summary: A simple framework for building complex web applications.
 Maintainer-email: Pallets <contact@palletsprojects.com>
-Requires-Python: >=3.8
-Description-Content-Type: text/x-rst
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-Expression: BSD-3-Clause
 Classifier: Development Status :: 5 - Production/Stable
 Classifier: Environment :: Web Environment
+Classifier: Framework :: Flask
 Classifier: Intended Audience :: Developers
-Classifier: License :: OSI Approved :: BSD License
 Classifier: Operating System :: OS Independent
 Classifier: Programming Language :: Python
 Classifier: Topic :: Internet :: WWW/HTTP :: Dynamic Content
-Requires-Dist: flask>=2.2.5
-Requires-Dist: sqlalchemy>=2.0.16
-Project-URL: Changes, https://flask-sqlalchemy.palletsprojects.com/changes/
+Classifier: Topic :: Internet :: WWW/HTTP :: WSGI
+Classifier: Topic :: Internet :: WWW/HTTP :: WSGI :: Application
+Classifier: Topic :: Software Development :: Libraries :: Application Frameworks
+Classifier: Typing :: Typed
+License-File: LICENSE.txt
+Requires-Dist: blinker>=1.9.0
+Requires-Dist: click>=8.1.3
+Requires-Dist: importlib-metadata>=3.6.0; python_version < '3.10'
+Requires-Dist: itsdangerous>=2.2.0
+Requires-Dist: jinja2>=3.1.2
+Requires-Dist: markupsafe>=2.1.1
+Requires-Dist: werkzeug>=3.1.0
+Requires-Dist: asgiref>=3.2 ; extra == "async"
+Requires-Dist: python-dotenv ; extra == "dotenv"
+Project-URL: Changes, https://flask.palletsprojects.com/page/changes/
 Project-URL: Chat, https://discord.gg/pallets
-Project-URL: Documentation, https://flask-sqlalchemy.palletsprojects.com
+Project-URL: Documentation, https://flask.palletsprojects.com/
 Project-URL: Donate, https://palletsprojects.com/donate
-Project-URL: Issue Tracker, https://github.com/pallets-eco/flask-sqlalchemy/issues/
-Project-URL: Source Code, https://github.com/pallets-eco/flask-sqlalchemy/
+Project-URL: Source, https://github.com/pallets/flask/
+Provides-Extra: async
+Provides-Extra: dotenv
 
-Flask-SQLAlchemy
-================
+# Flask
 
-Flask-SQLAlchemy is an extension for `Flask`_ that adds support for
-`SQLAlchemy`_ to your application. It aims to simplify using SQLAlchemy
-with Flask by providing useful defaults and extra helpers that make it
-easier to accomplish common tasks.
+Flask is a lightweight [WSGI] web application framework. It is designed
+to make getting started quick and easy, with the ability to scale up to
+complex applications. It began as a simple wrapper around [Werkzeug]
+and [Jinja], and has become one of the most popular Python web
+application frameworks.
 
-.. _Flask: https://palletsprojects.com/p/flask/
-.. _SQLAlchemy: https://www.sqlalchemy.org
+Flask offers suggestions, but doesn't enforce any dependencies or
+project layout. It is up to the developer to choose the tools and
+libraries they want to use. There are many extensions provided by the
+community that make adding new functionality easy.
 
+[WSGI]: https://wsgi.readthedocs.io/
+[Werkzeug]: https://werkzeug.palletsprojects.com/
+[Jinja]: https://jinja.palletsprojects.com/
 
-Installing
-----------
+## A Simple Example
 
-Install and update using `pip`_:
+```python
+# save this as app.py
+from flask import Flask
 
-.. code-block:: text
+app = Flask(__name__)
 
-  $ pip install -U Flask-SQLAlchemy
+@app.route("/")
+def hello():
+    return "Hello, World!"
+```
 
-.. _pip: https://pip.pypa.io/en/stable/getting-started/
+```
+$ flask run
+  * Running on http://127.0.0.1:5000/ (Press CTRL+C to quit)
+```
 
+## Donate
 
-A Simple Example
-----------------
+The Pallets organization develops and supports Flask and the libraries
+it uses. In order to grow the community of contributors and users, and
+allow the maintainers to devote more time to the projects, [please
+donate today].
 
-.. code-block:: python
+[please donate today]: https://palletsprojects.com/donate
 
-    from flask import Flask
-    from flask_sqlalchemy import SQLAlchemy
-    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+## Contributing
 
-    app = Flask(__name__)
-    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///example.sqlite"
+See our [detailed contributing documentation][contrib] for many ways to
+contribute, including reporting issues, requesting features, asking or answering
+questions, and making PRs.
 
-    class Base(DeclarativeBase):
-      pass
-
-    db = SQLAlchemy(app, model_class=Base)
-
-    class User(db.Model):
-        id: Mapped[int] = mapped_column(db.Integer, primary_key=True)
-        username: Mapped[str] = mapped_column(db.String, unique=True, nullable=False)
-
-    with app.app_context():
-        db.create_all()
-
-        db.session.add(User(username="example"))
-        db.session.commit()
-
-        users = db.session.execute(db.select(User)).scalars()
-
-
-Contributing
-------------
-
-For guidance on setting up a development environment and how to make a
-contribution to Flask-SQLAlchemy, see the `contributing guidelines`_.
-
-.. _contributing guidelines: https://github.com/pallets-eco/flask-sqlalchemy/blob/main/CONTRIBUTING.rst
-
-
-Donate
-------
-
-The Pallets organization develops and supports Flask-SQLAlchemy and
-other popular packages. In order to grow the community of contributors
-and users, and allow the maintainers to devote more time to the
-projects, `please donate today`_.
-
-.. _please donate today: https://palletsprojects.com/donate
-
-
-Links
------
-
--   Documentation: https://flask-sqlalchemy.palletsprojects.com/
--   Changes: https://flask-sqlalchemy.palletsprojects.com/changes/
--   PyPI Releases: https://pypi.org/project/Flask-SQLAlchemy/
--   Source Code: https://github.com/pallets-eco/flask-sqlalchemy/
--   Issue Tracker: https://github.com/pallets-eco/flask-sqlalchemy/issues/
--   Website: https://palletsprojects.com/
--   Twitter: https://twitter.com/PalletsTeam
--   Chat: https://discord.gg/pallets
+[contrib]: https://palletsprojects.com/contributing/
 
