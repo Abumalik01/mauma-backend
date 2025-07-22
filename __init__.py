@@ -1,123 +1,170 @@
-"""
-Click is a simple Python module inspired by the stdlib optparse to make
-writing command line scripts fun. Unlike other modules, it's based
-around a simple API that does not come with too much magic and is
-composable.
-"""
-
 from __future__ import annotations
 
-from .core import Argument as Argument
-from .core import Command as Command
-from .core import CommandCollection as CommandCollection
-from .core import Context as Context
-from .core import Group as Group
-from .core import Option as Option
-from .core import Parameter as Parameter
-from .decorators import argument as argument
-from .decorators import command as command
-from .decorators import confirmation_option as confirmation_option
-from .decorators import group as group
-from .decorators import help_option as help_option
-from .decorators import make_pass_decorator as make_pass_decorator
-from .decorators import option as option
-from .decorators import pass_context as pass_context
-from .decorators import pass_obj as pass_obj
-from .decorators import password_option as password_option
-from .decorators import version_option as version_option
-from .exceptions import Abort as Abort
-from .exceptions import BadArgumentUsage as BadArgumentUsage
-from .exceptions import BadOptionUsage as BadOptionUsage
-from .exceptions import BadParameter as BadParameter
-from .exceptions import ClickException as ClickException
-from .exceptions import FileError as FileError
-from .exceptions import MissingParameter as MissingParameter
-from .exceptions import NoSuchOption as NoSuchOption
-from .exceptions import UsageError as UsageError
-from .formatting import HelpFormatter as HelpFormatter
-from .formatting import wrap_text as wrap_text
-from .globals import get_current_context as get_current_context
-from .termui import clear as clear
-from .termui import confirm as confirm
-from .termui import echo_via_pager as echo_via_pager
-from .termui import edit as edit
-from .termui import getchar as getchar
-from .termui import launch as launch
-from .termui import pause as pause
-from .termui import progressbar as progressbar
-from .termui import prompt as prompt
-from .termui import secho as secho
-from .termui import style as style
-from .termui import unstyle as unstyle
-from .types import BOOL as BOOL
-from .types import Choice as Choice
-from .types import DateTime as DateTime
-from .types import File as File
-from .types import FLOAT as FLOAT
-from .types import FloatRange as FloatRange
-from .types import INT as INT
-from .types import IntRange as IntRange
-from .types import ParamType as ParamType
-from .types import Path as Path
-from .types import STRING as STRING
-from .types import Tuple as Tuple
-from .types import UNPROCESSED as UNPROCESSED
-from .types import UUID as UUID
-from .utils import echo as echo
-from .utils import format_filename as format_filename
-from .utils import get_app_dir as get_app_dir
-from .utils import get_binary_stream as get_binary_stream
-from .utils import get_text_stream as get_text_stream
-from .utils import open_file as open_file
+import json as _json
+import typing as t
+
+from ..globals import current_app
+from .provider import _default
+
+if t.TYPE_CHECKING:  # pragma: no cover
+    from ..wrappers import Response
 
 
-def __getattr__(name: str) -> object:
-    import warnings
+def dumps(obj: t.Any, **kwargs: t.Any) -> str:
+    """Serialize data as JSON.
 
-    if name == "BaseCommand":
-        from .core import _BaseCommand
+    If :data:`~flask.current_app` is available, it will use its
+    :meth:`app.json.dumps() <flask.json.provider.JSONProvider.dumps>`
+    method, otherwise it will use :func:`json.dumps`.
 
-        warnings.warn(
-            "'BaseCommand' is deprecated and will be removed in Click 9.0. Use"
-            " 'Command' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return _BaseCommand
+    :param obj: The data to serialize.
+    :param kwargs: Arguments passed to the ``dumps`` implementation.
 
-    if name == "MultiCommand":
-        from .core import _MultiCommand
+    .. versionchanged:: 2.3
+        The ``app`` parameter was removed.
 
-        warnings.warn(
-            "'MultiCommand' is deprecated and will be removed in Click 9.0. Use"
-            " 'Group' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return _MultiCommand
+    .. versionchanged:: 2.2
+        Calls ``current_app.json.dumps``, allowing an app to override
+        the behavior.
 
-    if name == "OptionParser":
-        from .parser import _OptionParser
+    .. versionchanged:: 2.0.2
+        :class:`decimal.Decimal` is supported by converting to a string.
 
-        warnings.warn(
-            "'OptionParser' is deprecated and will be removed in Click 9.0. The"
-            " old parser is available in 'optparse'.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return _OptionParser
+    .. versionchanged:: 2.0
+        ``encoding`` will be removed in Flask 2.1.
 
-    if name == "__version__":
-        import importlib.metadata
-        import warnings
+    .. versionchanged:: 1.0.3
+        ``app`` can be passed directly, rather than requiring an app
+        context for configuration.
+    """
+    if current_app:
+        return current_app.json.dumps(obj, **kwargs)
 
-        warnings.warn(
-            "The '__version__' attribute is deprecated and will be removed in"
-            " Click 9.1. Use feature detection or"
-            " 'importlib.metadata.version(\"click\")' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return importlib.metadata.version("click")
+    kwargs.setdefault("default", _default)
+    return _json.dumps(obj, **kwargs)
 
-    raise AttributeError(name)
+
+def dump(obj: t.Any, fp: t.IO[str], **kwargs: t.Any) -> None:
+    """Serialize data as JSON and write to a file.
+
+    If :data:`~flask.current_app` is available, it will use its
+    :meth:`app.json.dump() <flask.json.provider.JSONProvider.dump>`
+    method, otherwise it will use :func:`json.dump`.
+
+    :param obj: The data to serialize.
+    :param fp: A file opened for writing text. Should use the UTF-8
+        encoding to be valid JSON.
+    :param kwargs: Arguments passed to the ``dump`` implementation.
+
+    .. versionchanged:: 2.3
+        The ``app`` parameter was removed.
+
+    .. versionchanged:: 2.2
+        Calls ``current_app.json.dump``, allowing an app to override
+        the behavior.
+
+    .. versionchanged:: 2.0
+        Writing to a binary file, and the ``encoding`` argument, will be
+        removed in Flask 2.1.
+    """
+    if current_app:
+        current_app.json.dump(obj, fp, **kwargs)
+    else:
+        kwargs.setdefault("default", _default)
+        _json.dump(obj, fp, **kwargs)
+
+
+def loads(s: str | bytes, **kwargs: t.Any) -> t.Any:
+    """Deserialize data as JSON.
+
+    If :data:`~flask.current_app` is available, it will use its
+    :meth:`app.json.loads() <flask.json.provider.JSONProvider.loads>`
+    method, otherwise it will use :func:`json.loads`.
+
+    :param s: Text or UTF-8 bytes.
+    :param kwargs: Arguments passed to the ``loads`` implementation.
+
+    .. versionchanged:: 2.3
+        The ``app`` parameter was removed.
+
+    .. versionchanged:: 2.2
+        Calls ``current_app.json.loads``, allowing an app to override
+        the behavior.
+
+    .. versionchanged:: 2.0
+        ``encoding`` will be removed in Flask 2.1. The data must be a
+        string or UTF-8 bytes.
+
+    .. versionchanged:: 1.0.3
+        ``app`` can be passed directly, rather than requiring an app
+        context for configuration.
+    """
+    if current_app:
+        return current_app.json.loads(s, **kwargs)
+
+    return _json.loads(s, **kwargs)
+
+
+def load(fp: t.IO[t.AnyStr], **kwargs: t.Any) -> t.Any:
+    """Deserialize data as JSON read from a file.
+
+    If :data:`~flask.current_app` is available, it will use its
+    :meth:`app.json.load() <flask.json.provider.JSONProvider.load>`
+    method, otherwise it will use :func:`json.load`.
+
+    :param fp: A file opened for reading text or UTF-8 bytes.
+    :param kwargs: Arguments passed to the ``load`` implementation.
+
+    .. versionchanged:: 2.3
+        The ``app`` parameter was removed.
+
+    .. versionchanged:: 2.2
+        Calls ``current_app.json.load``, allowing an app to override
+        the behavior.
+
+    .. versionchanged:: 2.2
+        The ``app`` parameter will be removed in Flask 2.3.
+
+    .. versionchanged:: 2.0
+        ``encoding`` will be removed in Flask 2.1. The file must be text
+        mode, or binary mode with UTF-8 bytes.
+    """
+    if current_app:
+        return current_app.json.load(fp, **kwargs)
+
+    return _json.load(fp, **kwargs)
+
+
+def jsonify(*args: t.Any, **kwargs: t.Any) -> Response:
+    """Serialize the given arguments as JSON, and return a
+    :class:`~flask.Response` object with the ``application/json``
+    mimetype. A dict or list returned from a view will be converted to a
+    JSON response automatically without needing to call this.
+
+    This requires an active request or application context, and calls
+    :meth:`app.json.response() <flask.json.provider.JSONProvider.response>`.
+
+    In debug mode, the output is formatted with indentation to make it
+    easier to read. This may also be controlled by the provider.
+
+    Either positional or keyword arguments can be given, not both.
+    If no arguments are given, ``None`` is serialized.
+
+    :param args: A single value to serialize, or multiple values to
+        treat as a list to serialize.
+    :param kwargs: Treat as a dict to serialize.
+
+    .. versionchanged:: 2.2
+        Calls ``current_app.json.response``, allowing an app to override
+        the behavior.
+
+    .. versionchanged:: 2.0.2
+        :class:`decimal.Decimal` is supported by converting to a string.
+
+    .. versionchanged:: 0.11
+        Added support for serializing top-level arrays. This was a
+        security risk in ancient browsers. See :ref:`security-json`.
+
+    .. versionadded:: 0.2
+    """
+    return current_app.json.response(*args, **kwargs)  # type: ignore[return-value]
