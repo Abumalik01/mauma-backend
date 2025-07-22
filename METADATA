@@ -1,125 +1,68 @@
-Metadata-Version: 2.1
-Name: setuptools
-Version: 59.6.0
-Summary: Easily download, build, install, upgrade, and uninstall Python packages
-Home-page: https://github.com/pypa/setuptools
-Author: Python Packaging Authority
-Author-email: distutils-sig@python.org
-License: UNKNOWN
-Project-URL: Documentation, https://setuptools.pypa.io/
-Keywords: CPAN PyPI distutils eggs package management
-Platform: UNKNOWN
+Metadata-Version: 2.4
+Name: typing_extensions
+Version: 4.14.0
+Summary: Backported and Experimental Type Hints for Python 3.9+
+Keywords: annotations,backport,checker,checking,function,hinting,hints,type,typechecking,typehinting,typehints,typing
+Author-email: "Guido van Rossum, Jukka Lehtosalo, Łukasz Langa, Michael Lee" <levkivskyi@gmail.com>
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-Expression: PSF-2.0
 Classifier: Development Status :: 5 - Production/Stable
+Classifier: Environment :: Console
 Classifier: Intended Audience :: Developers
-Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
 Classifier: Programming Language :: Python :: 3
 Classifier: Programming Language :: Python :: 3 :: Only
-Classifier: Topic :: Software Development :: Libraries :: Python Modules
-Classifier: Topic :: System :: Archiving :: Packaging
-Classifier: Topic :: System :: Systems Administration
-Classifier: Topic :: Utilities
-Requires-Python: >=3.6
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: Python :: 3.14
+Classifier: Topic :: Software Development
 License-File: LICENSE
-Provides-Extra: certs
-Provides-Extra: docs
-Requires-Dist: furo ; extra == 'docs'
-Requires-Dist: jaraco.packaging (>=8.2) ; extra == 'docs'
-Requires-Dist: jaraco.tidelift (>=1.4) ; extra == 'docs'
-Requires-Dist: pygments-github-lexers (==0.0.5) ; extra == 'docs'
-Requires-Dist: rst.linker (>=1.9) ; extra == 'docs'
-Requires-Dist: sphinx ; extra == 'docs'
-Requires-Dist: sphinx-inline-tabs ; extra == 'docs'
-Requires-Dist: sphinxcontrib-towncrier ; extra == 'docs'
-Provides-Extra: ssl
-Provides-Extra: testing
-Requires-Dist: flake8-2020 ; extra == 'testing'
-Requires-Dist: jaraco.envs (>=2.2) ; extra == 'testing'
-Requires-Dist: jaraco.path (>=3.2.0) ; extra == 'testing'
-Requires-Dist: mock ; extra == 'testing'
-Requires-Dist: paver ; extra == 'testing'
-Requires-Dist: pip (>=19.1) ; extra == 'testing'
-Requires-Dist: pytest-checkdocs (>=2.4) ; extra == 'testing'
-Requires-Dist: pytest-cov ; extra == 'testing'
-Requires-Dist: pytest-enabler (>=1.0.1) ; extra == 'testing'
-Requires-Dist: pytest-flake8 ; extra == 'testing'
-Requires-Dist: pytest-subprocess ; extra == 'testing'
-Requires-Dist: pytest-virtualenv (>=1.2.7) ; extra == 'testing'
-Requires-Dist: pytest-xdist ; extra == 'testing'
-Requires-Dist: pytest (>=6) ; extra == 'testing'
-Requires-Dist: sphinx ; extra == 'testing'
-Requires-Dist: virtualenv (>=13.0.0) ; extra == 'testing'
-Requires-Dist: wheel ; extra == 'testing'
-Requires-Dist: pytest-black (>=0.3.7) ; (platform_python_implementation != "PyPy") and extra == 'testing'
-Requires-Dist: pytest-mypy ; (platform_python_implementation != "PyPy") and extra == 'testing'
+Project-URL: Bug Tracker, https://github.com/python/typing_extensions/issues
+Project-URL: Changes, https://github.com/python/typing_extensions/blob/main/CHANGELOG.md
+Project-URL: Documentation, https://typing-extensions.readthedocs.io/
+Project-URL: Home, https://github.com/python/typing_extensions
+Project-URL: Q & A, https://github.com/python/typing/discussions
+Project-URL: Repository, https://github.com/python/typing_extensions
 
-.. image:: https://raw.githubusercontent.com/pypa/setuptools/main/docs/images/banner-640x320.svg
-   :align: center
+# Typing Extensions
 
-|
+[![Chat at https://gitter.im/python/typing](https://badges.gitter.im/python/typing.svg)](https://gitter.im/python/typing)
 
-.. image:: https://img.shields.io/pypi/v/setuptools.svg
-   :target: `PyPI link`_
+[Documentation](https://typing-extensions.readthedocs.io/en/latest/#) –
+[PyPI](https://pypi.org/project/typing-extensions/)
 
-.. image:: https://img.shields.io/pypi/pyversions/setuptools.svg
-   :target: `PyPI link`_
+## Overview
 
-.. _PyPI link: https://pypi.org/project/setuptools
+The `typing_extensions` module serves two related purposes:
 
-.. image:: https://github.com/pypa/setuptools/workflows/tests/badge.svg
-   :target: https://github.com/pypa/setuptools/actions?query=workflow%3A%22tests%22
-   :alt: tests
+- Enable use of new type system features on older Python versions. For example,
+  `typing.TypeGuard` is new in Python 3.10, but `typing_extensions` allows
+  users on previous Python versions to use it too.
+- Enable experimentation with new type system PEPs before they are accepted and
+  added to the `typing` module.
 
-.. image:: https://img.shields.io/badge/code%20style-black-000000.svg
-   :target: https://github.com/psf/black
-   :alt: Code style: Black
+`typing_extensions` is treated specially by static type checkers such as
+mypy and pyright. Objects defined in `typing_extensions` are treated the same
+way as equivalent forms in `typing`.
 
-.. image:: https://img.shields.io/readthedocs/setuptools/latest.svg
-    :target: https://setuptools.pypa.io
+`typing_extensions` uses
+[Semantic Versioning](https://semver.org/). The
+major version will be incremented only for backwards-incompatible changes.
+Therefore, it's safe to depend
+on `typing_extensions` like this: `typing_extensions >=x.y, <(x+1)`,
+where `x.y` is the first version that includes all features you need.
 
-.. image:: https://img.shields.io/badge/skeleton-2021-informational
-   :target: https://blog.jaraco.com/skeleton
+## Included items
 
-.. image:: https://img.shields.io/codecov/c/github/pypa/setuptools/master.svg?logo=codecov&logoColor=white
-   :target: https://codecov.io/gh/pypa/setuptools
+See [the documentation](https://typing-extensions.readthedocs.io/en/latest/#) for a
+complete listing of module contents.
 
-.. image:: https://tidelift.com/badges/github/pypa/setuptools?style=flat
-   :target: https://tidelift.com/subscription/pkg/pypi-setuptools?utm_source=pypi-setuptools&utm_medium=readme
+## Contributing
 
-See the `Installation Instructions
-<https://packaging.python.org/installing/>`_ in the Python Packaging
-User's Guide for instructions on installing, upgrading, and uninstalling
-Setuptools.
-
-Questions and comments should be directed to the `distutils-sig
-mailing list <http://mail.python.org/pipermail/distutils-sig/>`_.
-Bug reports and especially tested patches may be
-submitted directly to the `bug tracker
-<https://github.com/pypa/setuptools/issues>`_.
-
-
-Code of Conduct
-===============
-
-Everyone interacting in the setuptools project's codebases, issue trackers,
-chat rooms, and mailing lists is expected to follow the
-`PSF Code of Conduct <https://github.com/pypa/.github/blob/main/CODE_OF_CONDUCT.md>`_.
-
-
-For Enterprise
-==============
-
-Available as part of the Tidelift Subscription.
-
-Setuptools and the maintainers of thousands of other packages are working with Tidelift to deliver one enterprise subscription that covers all of the open source you use.
-
-`Learn more <https://tidelift.com/subscription/pkg/pypi-setuptools?utm_source=pypi-setuptools&utm_medium=referral&utm_campaign=github>`_.
-
-
-Security Contact
-================
-
-To report a security vulnerability, please use the
-`Tidelift security contact <https://tidelift.com/security>`_.
-Tidelift will coordinate the fix and disclosure.
-
+See [CONTRIBUTING.md](https://github.com/python/typing_extensions/blob/main/CONTRIBUTING.md)
+for how to contribute to `typing_extensions`.
 
