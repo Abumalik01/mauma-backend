@@ -1,4 +1,4 @@
-# orm/util.py
+# sql/util.py
 # Copyright (C) 2005-2025 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
@@ -6,2398 +6,1482 @@
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
 # mypy: allow-untyped-defs, allow-untyped-calls
 
+"""High level utilities which build upon other modules here.
+
+"""
 from __future__ import annotations
 
-import enum
-import functools
-import re
-import types
+from collections import deque
+import copy
+from itertools import chain
 import typing
 from typing import AbstractSet
 from typing import Any
 from typing import Callable
 from typing import cast
+from typing import Collection
 from typing import Dict
-from typing import FrozenSet
-from typing import Generic
 from typing import Iterable
 from typing import Iterator
 from typing import List
-from typing import Match
 from typing import Optional
+from typing import overload
 from typing import Sequence
 from typing import Tuple
-from typing import Type
 from typing import TYPE_CHECKING
 from typing import TypeVar
 from typing import Union
-import weakref
 
-from . import attributes  # noqa
-from . import exc
-from . import exc as orm_exc
-from ._typing import _O
-from ._typing import insp_is_aliased_class
-from ._typing import insp_is_mapper
-from ._typing import prop_is_relationship
-from .base import _class_to_mapper as _class_to_mapper
-from .base import _MappedAnnotationBase
-from .base import _never_set as _never_set  # noqa: F401
-from .base import _none_only_set as _none_only_set  # noqa: F401
-from .base import _none_set as _none_set  # noqa: F401
-from .base import attribute_str as attribute_str  # noqa: F401
-from .base import class_mapper as class_mapper
-from .base import DynamicMapped
-from .base import InspectionAttr as InspectionAttr
-from .base import instance_str as instance_str  # noqa: F401
-from .base import Mapped
-from .base import object_mapper as object_mapper
-from .base import object_state as object_state  # noqa: F401
-from .base import opt_manager_of_class
-from .base import ORMDescriptor
-from .base import state_attribute_str as state_attribute_str  # noqa: F401
-from .base import state_class_str as state_class_str  # noqa: F401
-from .base import state_str as state_str  # noqa: F401
-from .base import WriteOnlyMapped
-from .interfaces import CriteriaOption
-from .interfaces import MapperProperty as MapperProperty
-from .interfaces import ORMColumnsClauseRole
-from .interfaces import ORMEntityColumnsClauseRole
-from .interfaces import ORMFromClauseRole
-from .path_registry import PathRegistry as PathRegistry
-from .. import event
-from .. import exc as sa_exc
-from .. import inspection
-from .. import sql
+from . import coercions
+from . import operators
+from . import roles
+from . import visitors
+from ._typing import is_text_clause
+from .annotation import _deep_annotate as _deep_annotate  # noqa: F401
+from .annotation import _deep_deannotate as _deep_deannotate  # noqa: F401
+from .annotation import _shallow_annotate as _shallow_annotate  # noqa: F401
+from .base import _expand_cloned
+from .base import _from_objects
+from .cache_key import HasCacheKey as HasCacheKey  # noqa: F401
+from .ddl import sort_tables as sort_tables  # noqa: F401
+from .elements import _find_columns as _find_columns
+from .elements import _label_reference
+from .elements import _textual_label_reference
+from .elements import BindParameter
+from .elements import ClauseElement
+from .elements import ColumnClause
+from .elements import ColumnElement
+from .elements import Grouping
+from .elements import KeyedColumnElement
+from .elements import Label
+from .elements import NamedColumn
+from .elements import Null
+from .elements import UnaryExpression
+from .schema import Column
+from .selectable import Alias
+from .selectable import FromClause
+from .selectable import FromGrouping
+from .selectable import Join
+from .selectable import ScalarSelect
+from .selectable import SelectBase
+from .selectable import TableClause
+from .visitors import _ET
+from .. import exc
 from .. import util
-from ..engine.result import result_tuple
-from ..sql import coercions
-from ..sql import expression
-from ..sql import lambdas
-from ..sql import roles
-from ..sql import util as sql_util
-from ..sql import visitors
-from ..sql._typing import is_selectable
-from ..sql.annotation import SupportsCloneAnnotations
-from ..sql.base import ColumnCollection
-from ..sql.cache_key import HasCacheKey
-from ..sql.cache_key import MemoizedHasCacheKey
-from ..sql.elements import ColumnElement
-from ..sql.elements import KeyedColumnElement
-from ..sql.selectable import FromClause
-from ..util.langhelpers import MemoizedSlots
-from ..util.typing import de_stringify_annotation as _de_stringify_annotation
-from ..util.typing import eval_name_only as _eval_name_only
-from ..util.typing import fixup_container_fwd_refs
-from ..util.typing import get_origin
-from ..util.typing import is_origin_of_cls
 from ..util.typing import Literal
 from ..util.typing import Protocol
 
 if typing.TYPE_CHECKING:
-    from ._typing import _EntityType
-    from ._typing import _IdentityKeyType
-    from ._typing import _InternalEntityType
-    from ._typing import _ORMCOLEXPR
-    from .context import _MapperEntity
-    from .context import ORMCompileState
-    from .mapper import Mapper
-    from .path_registry import AbstractEntityRegistry
-    from .query import Query
-    from .relationships import RelationshipProperty
-    from ..engine import Row
-    from ..engine import RowMapping
-    from ..sql._typing import _CE
-    from ..sql._typing import _ColumnExpressionArgument
-    from ..sql._typing import _EquivalentColumnMap
-    from ..sql._typing import _FromClauseArgument
-    from ..sql._typing import _OnClauseArgument
-    from ..sql._typing import _PropagateAttrsType
-    from ..sql.annotation import _SA
-    from ..sql.base import ReadOnlyColumnCollection
-    from ..sql.elements import BindParameter
-    from ..sql.selectable import _ColumnsClauseElement
-    from ..sql.selectable import Select
-    from ..sql.selectable import Selectable
-    from ..sql.visitors import anon_map
-    from ..util.typing import _AnnotationScanType
-
-_T = TypeVar("_T", bound=Any)
-
-all_cascades = frozenset(
-    (
-        "delete",
-        "delete-orphan",
-        "all",
-        "merge",
-        "expunge",
-        "save-update",
-        "refresh-expire",
-        "none",
-    )
-)
-
-_de_stringify_partial = functools.partial(
-    functools.partial,
-    locals_=util.immutabledict(
-        {
-            "Mapped": Mapped,
-            "WriteOnlyMapped": WriteOnlyMapped,
-            "DynamicMapped": DynamicMapped,
-        }
-    ),
-)
-
-# partial is practically useless as we have to write out the whole
-# function and maintain the signature anyway
-
-
-class _DeStringifyAnnotation(Protocol):
-    def __call__(
-        self,
-        cls: Type[Any],
-        annotation: _AnnotationScanType,
-        originating_module: str,
-        *,
-        str_cleanup_fn: Optional[Callable[[str, str], str]] = None,
-        include_generic: bool = False,
-    ) -> Type[Any]: ...
-
-
-de_stringify_annotation = cast(
-    _DeStringifyAnnotation, _de_stringify_partial(_de_stringify_annotation)
-)
-
-
-class _EvalNameOnly(Protocol):
-    def __call__(self, name: str, module_name: str) -> Any: ...
-
-
-eval_name_only = cast(_EvalNameOnly, _de_stringify_partial(_eval_name_only))
-
-
-class CascadeOptions(FrozenSet[str]):
-    """Keeps track of the options sent to
-    :paramref:`.relationship.cascade`"""
-
-    _add_w_all_cascades = all_cascades.difference(
-        ["all", "none", "delete-orphan"]
-    )
-    _allowed_cascades = all_cascades
-
-    _viewonly_cascades = ["expunge", "all", "none", "refresh-expire", "merge"]
-
-    __slots__ = (
-        "save_update",
-        "delete",
-        "refresh_expire",
-        "merge",
-        "expunge",
-        "delete_orphan",
-    )
-
-    save_update: bool
-    delete: bool
-    refresh_expire: bool
-    merge: bool
-    expunge: bool
-    delete_orphan: bool
-
-    def __new__(
-        cls, value_list: Optional[Union[Iterable[str], str]]
-    ) -> CascadeOptions:
-        if isinstance(value_list, str) or value_list is None:
-            return cls.from_string(value_list)  # type: ignore
-        values = set(value_list)
-        if values.difference(cls._allowed_cascades):
-            raise sa_exc.ArgumentError(
-                "Invalid cascade option(s): %s"
-                % ", ".join(
-                    [
-                        repr(x)
-                        for x in sorted(
-                            values.difference(cls._allowed_cascades)
-                        )
-                    ]
-                )
-            )
-
-        if "all" in values:
-            values.update(cls._add_w_all_cascades)
-        if "none" in values:
-            values.clear()
-        values.discard("all")
-
-        self = super().__new__(cls, values)
-        self.save_update = "save-update" in values
-        self.delete = "delete" in values
-        self.refresh_expire = "refresh-expire" in values
-        self.merge = "merge" in values
-        self.expunge = "expunge" in values
-        self.delete_orphan = "delete-orphan" in values
-
-        if self.delete_orphan and not self.delete:
-            util.warn("The 'delete-orphan' cascade option requires 'delete'.")
-        return self
-
-    def __repr__(self):
-        return "CascadeOptions(%r)" % (",".join([x for x in sorted(self)]))
-
-    @classmethod
-    def from_string(cls, arg):
-        values = [c for c in re.split(r"\s*,\s*", arg or "") if c]
-        return cls(values)
-
-
-def _validator_events(desc, key, validator, include_removes, include_backrefs):
-    """Runs a validation method on an attribute value to be set or
-    appended.
-    """
-
-    if not include_backrefs:
-
-        def detect_is_backref(state, initiator):
-            impl = state.manager[key].impl
-            return initiator.impl is not impl
-
-    if include_removes:
-
-        def append(state, value, initiator):
-            if initiator.op is not attributes.OP_BULK_REPLACE and (
-                include_backrefs or not detect_is_backref(state, initiator)
-            ):
-                return validator(state.obj(), key, value, False)
-            else:
-                return value
-
-        def bulk_set(state, values, initiator):
-            if include_backrefs or not detect_is_backref(state, initiator):
-                obj = state.obj()
-                values[:] = [
-                    validator(obj, key, value, False) for value in values
-                ]
-
-        def set_(state, value, oldvalue, initiator):
-            if include_backrefs or not detect_is_backref(state, initiator):
-                return validator(state.obj(), key, value, False)
-            else:
-                return value
-
-        def remove(state, value, initiator):
-            if include_backrefs or not detect_is_backref(state, initiator):
-                validator(state.obj(), key, value, True)
-
-    else:
-
-        def append(state, value, initiator):
-            if initiator.op is not attributes.OP_BULK_REPLACE and (
-                include_backrefs or not detect_is_backref(state, initiator)
-            ):
-                return validator(state.obj(), key, value)
-            else:
-                return value
-
-        def bulk_set(state, values, initiator):
-            if include_backrefs or not detect_is_backref(state, initiator):
-                obj = state.obj()
-                values[:] = [validator(obj, key, value) for value in values]
-
-        def set_(state, value, oldvalue, initiator):
-            if include_backrefs or not detect_is_backref(state, initiator):
-                return validator(state.obj(), key, value)
-            else:
-                return value
-
-    event.listen(desc, "append", append, raw=True, retval=True)
-    event.listen(desc, "bulk_replace", bulk_set, raw=True)
-    event.listen(desc, "set", set_, raw=True, retval=True)
-    if include_removes:
-        event.listen(desc, "remove", remove, raw=True, retval=True)
-
-
-def polymorphic_union(
-    table_map, typecolname, aliasname="p_union", cast_nulls=True
-):
-    """Create a ``UNION`` statement used by a polymorphic mapper.
-
-    See  :ref:`concrete_inheritance` for an example of how
-    this is used.
-
-    :param table_map: mapping of polymorphic identities to
-     :class:`_schema.Table` objects.
-    :param typecolname: string name of a "discriminator" column, which will be
-     derived from the query, producing the polymorphic identity for
-     each row.  If ``None``, no polymorphic discriminator is generated.
-    :param aliasname: name of the :func:`~sqlalchemy.sql.expression.alias()`
-     construct generated.
-    :param cast_nulls: if True, non-existent columns, which are represented
-     as labeled NULLs, will be passed into CAST.   This is a legacy behavior
-     that is problematic on some backends such as Oracle - in which case it
-     can be set to False.
-
-    """
-
-    colnames: util.OrderedSet[str] = util.OrderedSet()
-    colnamemaps = {}
-    types = {}
-    for key in table_map:
-        table = table_map[key]
-
-        table = coercions.expect(
-            roles.StrictFromClauseRole, table, allow_select=True
-        )
-        table_map[key] = table
-
-        m = {}
-        for c in table.c:
-            if c.key == typecolname:
-                raise sa_exc.InvalidRequestError(
-                    "Polymorphic union can't use '%s' as the discriminator "
-                    "column due to mapped column %r; please apply the "
-                    "'typecolname' "
-                    "argument; this is available on "
-                    "ConcreteBase as '_concrete_discriminator_name'"
-                    % (typecolname, c)
-                )
-            colnames.add(c.key)
-            m[c.key] = c
-            types[c.key] = c.type
-        colnamemaps[table] = m
-
-    def col(name, table):
-        try:
-            return colnamemaps[table][name]
-        except KeyError:
-            if cast_nulls:
-                return sql.cast(sql.null(), types[name]).label(name)
-            else:
-                return sql.type_coerce(sql.null(), types[name]).label(name)
-
-    result = []
-    for type_, table in table_map.items():
-        if typecolname is not None:
-            result.append(
-                sql.select(
-                    *(
-                        [col(name, table) for name in colnames]
-                        + [
-                            sql.literal_column(
-                                sql_util._quote_ddl_expr(type_)
-                            ).label(typecolname)
-                        ]
-                    )
-                ).select_from(table)
-            )
-        else:
-            result.append(
-                sql.select(
-                    *[col(name, table) for name in colnames]
-                ).select_from(table)
-            )
-    return sql.union_all(*result).alias(aliasname)
-
-
-def identity_key(
-    class_: Optional[Type[_T]] = None,
-    ident: Union[Any, Tuple[Any, ...]] = None,
-    *,
-    instance: Optional[_T] = None,
-    row: Optional[Union[Row[Any], RowMapping]] = None,
-    identity_token: Optional[Any] = None,
-) -> _IdentityKeyType[_T]:
-    r"""Generate "identity key" tuples, as are used as keys in the
-    :attr:`.Session.identity_map` dictionary.
-
-    This function has several call styles:
-
-    * ``identity_key(class, ident, identity_token=token)``
-
-      This form receives a mapped class and a primary key scalar or
-      tuple as an argument.
-
-      E.g.::
-
-        >>> identity_key(MyClass, (1, 2))
-        (<class '__main__.MyClass'>, (1, 2), None)
-
-      :param class: mapped class (must be a positional argument)
-      :param ident: primary key, may be a scalar or tuple argument.
-      :param identity_token: optional identity token
-
-        .. versionadded:: 1.2 added identity_token
-
-
-    * ``identity_key(instance=instance)``
-
-      This form will produce the identity key for a given instance.  The
-      instance need not be persistent, only that its primary key attributes
-      are populated (else the key will contain ``None`` for those missing
-      values).
-
-      E.g.::
-
-        >>> instance = MyClass(1, 2)
-        >>> identity_key(instance=instance)
-        (<class '__main__.MyClass'>, (1, 2), None)
-
-      In this form, the given instance is ultimately run though
-      :meth:`_orm.Mapper.identity_key_from_instance`, which will have the
-      effect of performing a database check for the corresponding row
-      if the object is expired.
-
-      :param instance: object instance (must be given as a keyword arg)
-
-    * ``identity_key(class, row=row, identity_token=token)``
-
-      This form is similar to the class/tuple form, except is passed a
-      database result row as a :class:`.Row` or :class:`.RowMapping` object.
-
-      E.g.::
-
-        >>> row = engine.execute(text("select * from table where a=1 and b=2")).first()
-        >>> identity_key(MyClass, row=row)
-        (<class '__main__.MyClass'>, (1, 2), None)
-
-      :param class: mapped class (must be a positional argument)
-      :param row: :class:`.Row` row returned by a :class:`_engine.CursorResult`
-       (must be given as a keyword arg)
-      :param identity_token: optional identity token
-
-        .. versionadded:: 1.2 added identity_token
-
-    """  # noqa: E501
-    if class_ is not None:
-        mapper = class_mapper(class_)
-        if row is None:
-            if ident is None:
-                raise sa_exc.ArgumentError("ident or row is required")
-            return mapper.identity_key_from_primary_key(
-                tuple(util.to_list(ident)), identity_token=identity_token
-            )
-        else:
-            return mapper.identity_key_from_row(
-                row, identity_token=identity_token
-            )
-    elif instance is not None:
-        mapper = object_mapper(instance)
-        return mapper.identity_key_from_instance(instance)
-    else:
-        raise sa_exc.ArgumentError("class or instance is required")
-
-
-class _TraceAdaptRole(enum.Enum):
-    """Enumeration of all the use cases for ORMAdapter.
-
-    ORMAdapter remains one of the most complicated aspects of the ORM, as it is
-    used for in-place adaption of column expressions to be applied to a SELECT,
-    replacing :class:`.Table` and other objects that are mapped to classes with
-    aliases of those tables in the case of joined eager loading, or in the case
-    of polymorphic loading as used with concrete mappings or other custom "with
-    polymorphic" parameters, with whole user-defined subqueries. The
-    enumerations provide an overview of all the use cases used by ORMAdapter, a
-    layer of formality as to the introduction of new ORMAdapter use cases (of
-    which none are anticipated), as well as a means to trace the origins of a
-    particular ORMAdapter within runtime debugging.
-
-    SQLAlchemy 2.0 has greatly scaled back ORM features which relied heavily on
-    open-ended statement adaption, including the ``Query.with_polymorphic()``
-    method and the ``Query.select_from_entity()`` methods, favoring
-    user-explicit aliasing schemes using the ``aliased()`` and
-    ``with_polymorphic()`` standalone constructs; these still use adaption,
-    however the adaption is applied in a narrower scope.
-
-    """
-
-    # aliased() use that is used to adapt individual attributes at query
-    # construction time
-    ALIASED_INSP = enum.auto()
-
-    # joinedload cases; typically adapt an ON clause of a relationship
-    # join
-    JOINEDLOAD_USER_DEFINED_ALIAS = enum.auto()
-    JOINEDLOAD_PATH_WITH_POLYMORPHIC = enum.auto()
-    JOINEDLOAD_MEMOIZED_ADAPTER = enum.auto()
-
-    # polymorphic cases - these are complex ones that replace FROM
-    # clauses, replacing tables with subqueries
-    MAPPER_POLYMORPHIC_ADAPTER = enum.auto()
-    WITH_POLYMORPHIC_ADAPTER = enum.auto()
-    WITH_POLYMORPHIC_ADAPTER_RIGHT_JOIN = enum.auto()
-    DEPRECATED_JOIN_ADAPT_RIGHT_SIDE = enum.auto()
-
-    # the from_statement() case, used only to adapt individual attributes
-    # from a given statement to local ORM attributes at result fetching
-    # time.  assigned to ORMCompileState._from_obj_alias
-    ADAPT_FROM_STATEMENT = enum.auto()
-
-    # the joinedload for queries that have LIMIT/OFFSET/DISTINCT case;
-    # the query is placed inside of a subquery with the LIMIT/OFFSET/etc.,
-    # joinedloads are then placed on the outside.
-    # assigned to ORMCompileState.compound_eager_adapter
-    COMPOUND_EAGER_STATEMENT = enum.auto()
-
-    # the legacy Query._set_select_from() case.
-    # this is needed for Query's set operations (i.e. UNION, etc. )
-    # as well as "legacy from_self()", which while removed from 2.0 as
-    # public API, is used for the Query.count() method.  this one
-    # still does full statement traversal
-    # assigned to ORMCompileState._from_obj_alias
-    LEGACY_SELECT_FROM_ALIAS = enum.auto()
-
-
-class ORMStatementAdapter(sql_util.ColumnAdapter):
-    """ColumnAdapter which includes a role attribute."""
-
-    __slots__ = ("role",)
-
-    def __init__(
-        self,
-        role: _TraceAdaptRole,
-        selectable: Selectable,
-        *,
-        equivalents: Optional[_EquivalentColumnMap] = None,
-        adapt_required: bool = False,
-        allow_label_resolve: bool = True,
-        anonymize_labels: bool = False,
-        adapt_on_names: bool = False,
-        adapt_from_selectables: Optional[AbstractSet[FromClause]] = None,
-    ):
-        self.role = role
-        super().__init__(
-            selectable,
-            equivalents=equivalents,
-            adapt_required=adapt_required,
-            allow_label_resolve=allow_label_resolve,
-            anonymize_labels=anonymize_labels,
-            adapt_on_names=adapt_on_names,
-            adapt_from_selectables=adapt_from_selectables,
-        )
-
-
-class ORMAdapter(sql_util.ColumnAdapter):
-    """ColumnAdapter subclass which excludes adaptation of entities from
-    non-matching mappers.
-
-    """
-
-    __slots__ = ("role", "mapper", "is_aliased_class", "aliased_insp")
-
-    is_aliased_class: bool
-    aliased_insp: Optional[AliasedInsp[Any]]
-
-    def __init__(
-        self,
-        role: _TraceAdaptRole,
-        entity: _InternalEntityType[Any],
-        *,
-        equivalents: Optional[_EquivalentColumnMap] = None,
-        adapt_required: bool = False,
-        allow_label_resolve: bool = True,
-        anonymize_labels: bool = False,
-        selectable: Optional[Selectable] = None,
-        limit_on_entity: bool = True,
-        adapt_on_names: bool = False,
-        adapt_from_selectables: Optional[AbstractSet[FromClause]] = None,
-    ):
-        self.role = role
-        self.mapper = entity.mapper
-        if selectable is None:
-            selectable = entity.selectable
-        if insp_is_aliased_class(entity):
-            self.is_aliased_class = True
-            self.aliased_insp = entity
-        else:
-            self.is_aliased_class = False
-            self.aliased_insp = None
-
-        super().__init__(
-            selectable,
-            equivalents,
-            adapt_required=adapt_required,
-            allow_label_resolve=allow_label_resolve,
-            anonymize_labels=anonymize_labels,
-            include_fn=self._include_fn if limit_on_entity else None,
-            adapt_on_names=adapt_on_names,
-            adapt_from_selectables=adapt_from_selectables,
-        )
-
-    def _include_fn(self, elem):
-        entity = elem._annotations.get("parentmapper", None)
-
-        return not entity or entity.isa(self.mapper) or self.mapper.isa(entity)
-
-
-class AliasedClass(
-    inspection.Inspectable["AliasedInsp[_O]"], ORMColumnsClauseRole[_O]
-):
-    r"""Represents an "aliased" form of a mapped class for usage with Query.
-
-    The ORM equivalent of a :func:`~sqlalchemy.sql.expression.alias`
-    construct, this object mimics the mapped class using a
-    ``__getattr__`` scheme and maintains a reference to a
-    real :class:`~sqlalchemy.sql.expression.Alias` object.
-
-    A primary purpose of :class:`.AliasedClass` is to serve as an alternate
-    within a SQL statement generated by the ORM, such that an existing
-    mapped entity can be used in multiple contexts.   A simple example::
-
-        # find all pairs of users with the same name
-        user_alias = aliased(User)
-        session.query(User, user_alias).join(
-            (user_alias, User.id > user_alias.id)
-        ).filter(User.name == user_alias.name)
-
-    :class:`.AliasedClass` is also capable of mapping an existing mapped
-    class to an entirely new selectable, provided this selectable is column-
-    compatible with the existing mapped selectable, and it can also be
-    configured in a mapping as the target of a :func:`_orm.relationship`.
-    See the links below for examples.
-
-    The :class:`.AliasedClass` object is constructed typically using the
-    :func:`_orm.aliased` function.   It also is produced with additional
-    configuration when using the :func:`_orm.with_polymorphic` function.
-
-    The resulting object is an instance of :class:`.AliasedClass`.
-    This object implements an attribute scheme which produces the
-    same attribute and method interface as the original mapped
-    class, allowing :class:`.AliasedClass` to be compatible
-    with any attribute technique which works on the original class,
-    including hybrid attributes (see :ref:`hybrids_toplevel`).
-
-    The :class:`.AliasedClass` can be inspected for its underlying
-    :class:`_orm.Mapper`, aliased selectable, and other information
-    using :func:`_sa.inspect`::
-
-        from sqlalchemy import inspect
-
-        my_alias = aliased(MyClass)
-        insp = inspect(my_alias)
-
-    The resulting inspection object is an instance of :class:`.AliasedInsp`.
-
-
-    .. seealso::
-
-        :func:`.aliased`
-
-        :func:`.with_polymorphic`
-
-        :ref:`relationship_aliased_class`
-
-        :ref:`relationship_to_window_function`
-
-
-    """
-
-    __name__: str
-
-    def __init__(
-        self,
-        mapped_class_or_ac: _EntityType[_O],
-        alias: Optional[FromClause] = None,
-        name: Optional[str] = None,
-        flat: bool = False,
-        adapt_on_names: bool = False,
-        with_polymorphic_mappers: Optional[Sequence[Mapper[Any]]] = None,
-        with_polymorphic_discriminator: Optional[ColumnElement[Any]] = None,
-        base_alias: Optional[AliasedInsp[Any]] = None,
-        use_mapper_path: bool = False,
-        represents_outer_join: bool = False,
-    ):
-        insp = cast(
-            "_InternalEntityType[_O]", inspection.inspect(mapped_class_or_ac)
-        )
-        mapper = insp.mapper
-
-        nest_adapters = False
-
-        if alias is None:
-            if insp.is_aliased_class and insp.selectable._is_subquery:
-                alias = insp.selectable.alias()
-            else:
-                alias = (
-                    mapper._with_polymorphic_selectable._anonymous_fromclause(
-                        name=name,
-                        flat=flat,
-                    )
-                )
-        elif insp.is_aliased_class:
-            nest_adapters = True
-
-        assert alias is not None
-        self._aliased_insp = AliasedInsp(
-            self,
-            insp,
-            alias,
-            name,
-            (
-                with_polymorphic_mappers
-                if with_polymorphic_mappers
-                else mapper.with_polymorphic_mappers
-            ),
-            (
-                with_polymorphic_discriminator
-                if with_polymorphic_discriminator is not None
-                else mapper.polymorphic_on
-            ),
-            base_alias,
-            use_mapper_path,
-            adapt_on_names,
-            represents_outer_join,
-            nest_adapters,
-        )
-
-        self.__name__ = f"aliased({mapper.class_.__name__})"
-
-    @classmethod
-    def _reconstitute_from_aliased_insp(
-        cls, aliased_insp: AliasedInsp[_O]
-    ) -> AliasedClass[_O]:
-        obj = cls.__new__(cls)
-        obj.__name__ = f"aliased({aliased_insp.mapper.class_.__name__})"
-        obj._aliased_insp = aliased_insp
-
-        if aliased_insp._is_with_polymorphic:
-            for sub_aliased_insp in aliased_insp._with_polymorphic_entities:
-                if sub_aliased_insp is not aliased_insp:
-                    ent = AliasedClass._reconstitute_from_aliased_insp(
-                        sub_aliased_insp
-                    )
-                    setattr(obj, sub_aliased_insp.class_.__name__, ent)
-
-        return obj
-
-    def __getattr__(self, key: str) -> Any:
-        try:
-            _aliased_insp = self.__dict__["_aliased_insp"]
-        except KeyError:
-            raise AttributeError()
-        else:
-            target = _aliased_insp._target
-            # maintain all getattr mechanics
-            attr = getattr(target, key)
-
-        # attribute is a method, that will be invoked against a
-        # "self"; so just return a new method with the same function and
-        # new self
-        if hasattr(attr, "__call__") and hasattr(attr, "__self__"):
-            return types.MethodType(attr.__func__, self)
-
-        # attribute is a descriptor, that will be invoked against a
-        # "self"; so invoke the descriptor against this self
-        if hasattr(attr, "__get__"):
-            attr = attr.__get__(None, self)
-
-        # attributes within the QueryableAttribute system will want this
-        # to be invoked so the object can be adapted
-        if hasattr(attr, "adapt_to_entity"):
-            attr = attr.adapt_to_entity(_aliased_insp)
-            setattr(self, key, attr)
-
-        return attr
-
-    def _get_from_serialized(
-        self, key: str, mapped_class: _O, aliased_insp: AliasedInsp[_O]
-    ) -> Any:
-        # this method is only used in terms of the
-        # sqlalchemy.ext.serializer extension
-        attr = getattr(mapped_class, key)
-        if hasattr(attr, "__call__") and hasattr(attr, "__self__"):
-            return types.MethodType(attr.__func__, self)
-
-        # attribute is a descriptor, that will be invoked against a
-        # "self"; so invoke the descriptor against this self
-        if hasattr(attr, "__get__"):
-            attr = attr.__get__(None, self)
-
-        # attributes within the QueryableAttribute system will want this
-        # to be invoked so the object can be adapted
-        if hasattr(attr, "adapt_to_entity"):
-            aliased_insp._weak_entity = weakref.ref(self)
-            attr = attr.adapt_to_entity(aliased_insp)
-            setattr(self, key, attr)
-
-        return attr
-
-    def __repr__(self) -> str:
-        return "<AliasedClass at 0x%x; %s>" % (
-            id(self),
-            self._aliased_insp._target.__name__,
-        )
-
-    def __str__(self) -> str:
-        return str(self._aliased_insp)
-
-
-@inspection._self_inspects
-class AliasedInsp(
-    ORMEntityColumnsClauseRole[_O],
-    ORMFromClauseRole,
-    HasCacheKey,
-    InspectionAttr,
-    MemoizedSlots,
-    inspection.Inspectable["AliasedInsp[_O]"],
-    Generic[_O],
-):
-    """Provide an inspection interface for an
-    :class:`.AliasedClass` object.
-
-    The :class:`.AliasedInsp` object is returned
-    given an :class:`.AliasedClass` using the
-    :func:`_sa.inspect` function::
-
-        from sqlalchemy import inspect
-        from sqlalchemy.orm import aliased
-
-        my_alias = aliased(MyMappedClass)
-        insp = inspect(my_alias)
-
-    Attributes on :class:`.AliasedInsp`
-    include:
-
-    * ``entity`` - the :class:`.AliasedClass` represented.
-    * ``mapper`` - the :class:`_orm.Mapper` mapping the underlying class.
-    * ``selectable`` - the :class:`_expression.Alias`
-      construct which ultimately
-      represents an aliased :class:`_schema.Table` or
-      :class:`_expression.Select`
-      construct.
-    * ``name`` - the name of the alias.  Also is used as the attribute
-      name when returned in a result tuple from :class:`_query.Query`.
-    * ``with_polymorphic_mappers`` - collection of :class:`_orm.Mapper`
-      objects
-      indicating all those mappers expressed in the select construct
-      for the :class:`.AliasedClass`.
-    * ``polymorphic_on`` - an alternate column or SQL expression which
-      will be used as the "discriminator" for a polymorphic load.
-
-    .. seealso::
-
-        :ref:`inspection_toplevel`
-
-    """
-
-    __slots__ = (
-        "__weakref__",
-        "_weak_entity",
-        "mapper",
-        "selectable",
-        "name",
-        "_adapt_on_names",
-        "with_polymorphic_mappers",
-        "polymorphic_on",
-        "_use_mapper_path",
-        "_base_alias",
-        "represents_outer_join",
-        "persist_selectable",
-        "local_table",
-        "_is_with_polymorphic",
-        "_with_polymorphic_entities",
-        "_adapter",
-        "_target",
-        "__clause_element__",
-        "_memoized_values",
-        "_all_column_expressions",
-        "_nest_adapters",
-    )
-
-    _cache_key_traversal = [
-        ("name", visitors.ExtendedInternalTraversal.dp_string),
-        ("_adapt_on_names", visitors.ExtendedInternalTraversal.dp_boolean),
-        ("_use_mapper_path", visitors.ExtendedInternalTraversal.dp_boolean),
-        ("_target", visitors.ExtendedInternalTraversal.dp_inspectable),
-        ("selectable", visitors.ExtendedInternalTraversal.dp_clauseelement),
-        (
-            "with_polymorphic_mappers",
-            visitors.InternalTraversal.dp_has_cache_key_list,
-        ),
-        ("polymorphic_on", visitors.InternalTraversal.dp_clauseelement),
-    ]
-
-    mapper: Mapper[_O]
-    selectable: FromClause
-    _adapter: ORMAdapter
-    with_polymorphic_mappers: Sequence[Mapper[Any]]
-    _with_polymorphic_entities: Sequence[AliasedInsp[Any]]
-
-    _weak_entity: weakref.ref[AliasedClass[_O]]
-    """the AliasedClass that refers to this AliasedInsp"""
-
-    _target: Union[Type[_O], AliasedClass[_O]]
-    """the thing referenced by the AliasedClass/AliasedInsp.
-
-    In the vast majority of cases, this is the mapped class.  However
-    it may also be another AliasedClass (alias of alias).
-
-    """
-
-    def __init__(
-        self,
-        entity: AliasedClass[_O],
-        inspected: _InternalEntityType[_O],
-        selectable: FromClause,
-        name: Optional[str],
-        with_polymorphic_mappers: Optional[Sequence[Mapper[Any]]],
-        polymorphic_on: Optional[ColumnElement[Any]],
-        _base_alias: Optional[AliasedInsp[Any]],
-        _use_mapper_path: bool,
-        adapt_on_names: bool,
-        represents_outer_join: bool,
-        nest_adapters: bool,
-    ):
-        mapped_class_or_ac = inspected.entity
-        mapper = inspected.mapper
-
-        self._weak_entity = weakref.ref(entity)
-        self.mapper = mapper
-        self.selectable = self.persist_selectable = self.local_table = (
-            selectable
-        )
-        self.name = name
-        self.polymorphic_on = polymorphic_on
-        self._base_alias = weakref.ref(_base_alias or self)
-        self._use_mapper_path = _use_mapper_path
-        self.represents_outer_join = represents_outer_join
-        self._nest_adapters = nest_adapters
-
-        if with_polymorphic_mappers:
-            self._is_with_polymorphic = True
-            self.with_polymorphic_mappers = with_polymorphic_mappers
-            self._with_polymorphic_entities = []
-            for poly in self.with_polymorphic_mappers:
-                if poly is not mapper:
-                    ent = AliasedClass(
-                        poly.class_,
-                        selectable,
-                        base_alias=self,
-                        adapt_on_names=adapt_on_names,
-                        use_mapper_path=_use_mapper_path,
-                    )
-
-                    setattr(self.entity, poly.class_.__name__, ent)
-                    self._with_polymorphic_entities.append(ent._aliased_insp)
-
-        else:
-            self._is_with_polymorphic = False
-            self.with_polymorphic_mappers = [mapper]
-
-        self._adapter = ORMAdapter(
-            _TraceAdaptRole.ALIASED_INSP,
-            mapper,
-            selectable=selectable,
-            equivalents=mapper._equivalent_columns,
-            adapt_on_names=adapt_on_names,
-            anonymize_labels=True,
-            # make sure the adapter doesn't try to grab other tables that
-            # are not even the thing we are mapping, such as embedded
-            # selectables in subqueries or CTEs.  See issue #6060
-            adapt_from_selectables={
-                m.selectable
-                for m in self.with_polymorphic_mappers
-                if not adapt_on_names
-            },
-            limit_on_entity=False,
-        )
-
-        if nest_adapters:
-            # supports "aliased class of aliased class" use case
-            assert isinstance(inspected, AliasedInsp)
-            self._adapter = inspected._adapter.wrap(self._adapter)
-
-        self._adapt_on_names = adapt_on_names
-        self._target = mapped_class_or_ac
-
-    @classmethod
-    def _alias_factory(
-        cls,
-        element: Union[_EntityType[_O], FromClause],
-        alias: Optional[FromClause] = None,
-        name: Optional[str] = None,
-        flat: bool = False,
-        adapt_on_names: bool = False,
-    ) -> Union[AliasedClass[_O], FromClause]:
-        if isinstance(element, FromClause):
-            if adapt_on_names:
-                raise sa_exc.ArgumentError(
-                    "adapt_on_names only applies to ORM elements"
-                )
-            if name:
-                return element.alias(name=name, flat=flat)
-            else:
-                return coercions.expect(
-                    roles.AnonymizedFromClauseRole, element, flat=flat
-                )
-        else:
-            return AliasedClass(
-                element,
-                alias=alias,
-                flat=flat,
-                name=name,
-                adapt_on_names=adapt_on_names,
-            )
-
-    @classmethod
-    def _with_polymorphic_factory(
-        cls,
-        base: Union[Type[_O], Mapper[_O]],
-        classes: Union[Literal["*"], Iterable[_EntityType[Any]]],
-        selectable: Union[Literal[False, None], FromClause] = False,
-        flat: bool = False,
-        polymorphic_on: Optional[ColumnElement[Any]] = None,
-        aliased: bool = False,
-        innerjoin: bool = False,
-        adapt_on_names: bool = False,
-        name: Optional[str] = None,
-        _use_mapper_path: bool = False,
-    ) -> AliasedClass[_O]:
-        primary_mapper = _class_to_mapper(base)
-
-        if selectable not in (None, False) and flat:
-            raise sa_exc.ArgumentError(
-                "the 'flat' and 'selectable' arguments cannot be passed "
-                "simultaneously to with_polymorphic()"
-            )
-
-        mappers, selectable = primary_mapper._with_polymorphic_args(
-            classes, selectable, innerjoin=innerjoin
-        )
-        if aliased or flat:
-            assert selectable is not None
-            selectable = selectable._anonymous_fromclause(flat=flat)
-
-        return AliasedClass(
-            base,
-            selectable,
-            name=name,
-            with_polymorphic_mappers=mappers,
-            adapt_on_names=adapt_on_names,
-            with_polymorphic_discriminator=polymorphic_on,
-            use_mapper_path=_use_mapper_path,
-            represents_outer_join=not innerjoin,
-        )
-
-    @property
-    def entity(self) -> AliasedClass[_O]:
-        # to eliminate reference cycles, the AliasedClass is held weakly.
-        # this produces some situations where the AliasedClass gets lost,
-        # particularly when one is created internally and only the AliasedInsp
-        # is passed around.
-        # to work around this case, we just generate a new one when we need
-        # it, as it is a simple class with very little initial state on it.
-        ent = self._weak_entity()
-        if ent is None:
-            ent = AliasedClass._reconstitute_from_aliased_insp(self)
-            self._weak_entity = weakref.ref(ent)
-        return ent
-
-    is_aliased_class = True
-    "always returns True"
-
-    def _memoized_method___clause_element__(self) -> FromClause:
-        return self.selectable._annotate(
-            {
-                "parentmapper": self.mapper,
-                "parententity": self,
-                "entity_namespace": self,
-            }
-        )._set_propagate_attrs(
-            {"compile_state_plugin": "orm", "plugin_subject": self}
-        )
-
-    @property
-    def entity_namespace(self) -> AliasedClass[_O]:
-        return self.entity
-
-    @property
-    def class_(self) -> Type[_O]:
-        """Return the mapped class ultimately represented by this
-        :class:`.AliasedInsp`."""
-        return self.mapper.class_
-
-    @property
-    def _path_registry(self) -> AbstractEntityRegistry:
-        if self._use_mapper_path:
-            return self.mapper._path_registry
-        else:
-            return PathRegistry.per_mapper(self)
-
-    def __getstate__(self) -> Dict[str, Any]:
-        return {
-            "entity": self.entity,
-            "mapper": self.mapper,
-            "alias": self.selectable,
-            "name": self.name,
-            "adapt_on_names": self._adapt_on_names,
-            "with_polymorphic_mappers": self.with_polymorphic_mappers,
-            "with_polymorphic_discriminator": self.polymorphic_on,
-            "base_alias": self._base_alias(),
-            "use_mapper_path": self._use_mapper_path,
-            "represents_outer_join": self.represents_outer_join,
-            "nest_adapters": self._nest_adapters,
-        }
-
-    def __setstate__(self, state: Dict[str, Any]) -> None:
-        self.__init__(  # type: ignore
-            state["entity"],
-            state["mapper"],
-            state["alias"],
-            state["name"],
-            state["with_polymorphic_mappers"],
-            state["with_polymorphic_discriminator"],
-            state["base_alias"],
-            state["use_mapper_path"],
-            state["adapt_on_names"],
-            state["represents_outer_join"],
-            state["nest_adapters"],
-        )
-
-    def _merge_with(self, other: AliasedInsp[_O]) -> AliasedInsp[_O]:
-        # assert self._is_with_polymorphic
-        # assert other._is_with_polymorphic
-
-        primary_mapper = other.mapper
-
-        assert self.mapper is primary_mapper
-
-        our_classes = util.to_set(
-            mp.class_ for mp in self.with_polymorphic_mappers
-        )
-        new_classes = {mp.class_ for mp in other.with_polymorphic_mappers}
-        if our_classes == new_classes:
-            return other
-        else:
-            classes = our_classes.union(new_classes)
-
-        mappers, selectable = primary_mapper._with_polymorphic_args(
-            classes, None, innerjoin=not other.represents_outer_join
-        )
-        selectable = selectable._anonymous_fromclause(flat=True)
-        return AliasedClass(
-            primary_mapper,
-            selectable,
-            with_polymorphic_mappers=mappers,
-            with_polymorphic_discriminator=other.polymorphic_on,
-            use_mapper_path=other._use_mapper_path,
-            represents_outer_join=other.represents_outer_join,
-        )._aliased_insp
-
-    def _adapt_element(
-        self, expr: _ORMCOLEXPR, key: Optional[str] = None
-    ) -> _ORMCOLEXPR:
-        assert isinstance(expr, ColumnElement)
-        d: Dict[str, Any] = {
-            "parententity": self,
-            "parentmapper": self.mapper,
-        }
-        if key:
-            d["proxy_key"] = key
-
-        # IMO mypy should see this one also as returning the same type
-        # we put into it, but it's not
-        return (
-            self._adapter.traverse(expr)
-            ._annotate(d)
-            ._set_propagate_attrs(
-                {"compile_state_plugin": "orm", "plugin_subject": self}
-            )
-        )
-
-    if TYPE_CHECKING:
-        # establish compatibility with the _ORMAdapterProto protocol,
-        # which in turn is compatible with _CoreAdapterProto.
-
-        def _orm_adapt_element(
-            self,
-            obj: _CE,
-            key: Optional[str] = None,
-        ) -> _CE: ...
-
-    else:
-        _orm_adapt_element = _adapt_element
-
-    def _entity_for_mapper(self, mapper):
-        self_poly = self.with_polymorphic_mappers
-        if mapper in self_poly:
-            if mapper is self.mapper:
-                return self
-            else:
-                return getattr(
-                    self.entity, mapper.class_.__name__
-                )._aliased_insp
-        elif mapper.isa(self.mapper):
-            return self
-        else:
-            assert False, "mapper %s doesn't correspond to %s" % (mapper, self)
-
-    def _memoized_attr__get_clause(self):
-        onclause, replacemap = self.mapper._get_clause
-        return (
-            self._adapter.traverse(onclause),
-            {
-                self._adapter.traverse(col): param
-                for col, param in replacemap.items()
-            },
-        )
-
-    def _memoized_attr__memoized_values(self):
-        return {}
-
-    def _memoized_attr__all_column_expressions(self):
-        if self._is_with_polymorphic:
-            cols_plus_keys = self.mapper._columns_plus_keys(
-                [ent.mapper for ent in self._with_polymorphic_entities]
-            )
-        else:
-            cols_plus_keys = self.mapper._columns_plus_keys()
-
-        cols_plus_keys = [
-            (key, self._adapt_element(col)) for key, col in cols_plus_keys
-        ]
-
-        return ColumnCollection(cols_plus_keys)
-
-    def _memo(self, key, callable_, *args, **kw):
-        if key in self._memoized_values:
-            return self._memoized_values[key]
-        else:
-            self._memoized_values[key] = value = callable_(*args, **kw)
-            return value
-
-    def __repr__(self):
-        if self.with_polymorphic_mappers:
-            with_poly = "(%s)" % ", ".join(
-                mp.class_.__name__ for mp in self.with_polymorphic_mappers
-            )
-        else:
-            with_poly = ""
-        return "<AliasedInsp at 0x%x; %s%s>" % (
-            id(self),
-            self.class_.__name__,
-            with_poly,
-        )
-
-    def __str__(self):
-        if self._is_with_polymorphic:
-            return "with_polymorphic(%s, [%s])" % (
-                self._target.__name__,
-                ", ".join(
-                    mp.class_.__name__
-                    for mp in self.with_polymorphic_mappers
-                    if mp is not self.mapper
-                ),
-            )
-        else:
-            return "aliased(%s)" % (self._target.__name__,)
-
-
-class _WrapUserEntity:
-    """A wrapper used within the loader_criteria lambda caller so that
-    we can bypass declared_attr descriptors on unmapped mixins, which
-    normally emit a warning for such use.
-
-    might also be useful for other per-lambda instrumentations should
-    the need arise.
-
-    """
-
-    __slots__ = ("subject",)
-
-    def __init__(self, subject):
-        self.subject = subject
-
-    @util.preload_module("sqlalchemy.orm.decl_api")
-    def __getattribute__(self, name):
-        decl_api = util.preloaded.orm.decl_api
-
-        subject = object.__getattribute__(self, "subject")
-        if name in subject.__dict__ and isinstance(
-            subject.__dict__[name], decl_api.declared_attr
-        ):
-            return subject.__dict__[name].fget(subject)
-        else:
-            return getattr(subject, name)
-
-
-class LoaderCriteriaOption(CriteriaOption):
-    """Add additional WHERE criteria to the load for all occurrences of
-    a particular entity.
-
-    :class:`_orm.LoaderCriteriaOption` is invoked using the
-    :func:`_orm.with_loader_criteria` function; see that function for
-    details.
-
-    .. versionadded:: 1.4
-
-    """
-
-    __slots__ = (
-        "root_entity",
-        "entity",
-        "deferred_where_criteria",
-        "where_criteria",
-        "_where_crit_orig",
-        "include_aliases",
-        "propagate_to_loaders",
-    )
-
-    _traverse_internals = [
-        ("root_entity", visitors.ExtendedInternalTraversal.dp_plain_obj),
-        ("entity", visitors.ExtendedInternalTraversal.dp_has_cache_key),
-        ("where_criteria", visitors.InternalTraversal.dp_clauseelement),
-        ("include_aliases", visitors.InternalTraversal.dp_boolean),
-        ("propagate_to_loaders", visitors.InternalTraversal.dp_boolean),
-    ]
-
-    root_entity: Optional[Type[Any]]
-    entity: Optional[_InternalEntityType[Any]]
-    where_criteria: Union[ColumnElement[bool], lambdas.DeferredLambdaElement]
-    deferred_where_criteria: bool
-    include_aliases: bool
-    propagate_to_loaders: bool
-
-    _where_crit_orig: Any
-
-    def __init__(
-        self,
-        entity_or_base: _EntityType[Any],
-        where_criteria: Union[
-            _ColumnExpressionArgument[bool],
-            Callable[[Any], _ColumnExpressionArgument[bool]],
-        ],
-        loader_only: bool = False,
-        include_aliases: bool = False,
-        propagate_to_loaders: bool = True,
-        track_closure_variables: bool = True,
-    ):
-        entity = cast(
-            "_InternalEntityType[Any]",
-            inspection.inspect(entity_or_base, False),
-        )
-        if entity is None:
-            self.root_entity = cast("Type[Any]", entity_or_base)
-            self.entity = None
-        else:
-            self.root_entity = None
-            self.entity = entity
-
-        self._where_crit_orig = where_criteria
-        if callable(where_criteria):
-            if self.root_entity is not None:
-                wrap_entity = self.root_entity
-            else:
-                assert entity is not None
-                wrap_entity = entity.entity
-
-            self.deferred_where_criteria = True
-            self.where_criteria = lambdas.DeferredLambdaElement(
-                where_criteria,
-                roles.WhereHavingRole,
-                lambda_args=(_WrapUserEntity(wrap_entity),),
-                opts=lambdas.LambdaOptions(
-                    track_closure_variables=track_closure_variables
-                ),
-            )
-        else:
-            self.deferred_where_criteria = False
-            self.where_criteria = coercions.expect(
-                roles.WhereHavingRole, where_criteria
-            )
-
-        self.include_aliases = include_aliases
-        self.propagate_to_loaders = propagate_to_loaders
-
-    @classmethod
-    def _unreduce(
-        cls, entity, where_criteria, include_aliases, propagate_to_loaders
-    ):
-        return LoaderCriteriaOption(
-            entity,
-            where_criteria,
-            include_aliases=include_aliases,
-            propagate_to_loaders=propagate_to_loaders,
-        )
-
-    def __reduce__(self):
-        return (
-            LoaderCriteriaOption._unreduce,
-            (
-                self.entity.class_ if self.entity else self.root_entity,
-                self._where_crit_orig,
-                self.include_aliases,
-                self.propagate_to_loaders,
-            ),
-        )
-
-    def _all_mappers(self) -> Iterator[Mapper[Any]]:
-        if self.entity:
-            yield from self.entity.mapper.self_and_descendants
-        else:
-            assert self.root_entity
-            stack = list(self.root_entity.__subclasses__())
-            while stack:
-                subclass = stack.pop(0)
-                ent = cast(
-                    "_InternalEntityType[Any]",
-                    inspection.inspect(subclass, raiseerr=False),
-                )
-                if ent:
-                    yield from ent.mapper.self_and_descendants
-                else:
-                    stack.extend(subclass.__subclasses__())
-
-    def _should_include(self, compile_state: ORMCompileState) -> bool:
-        if (
-            compile_state.select_statement._annotations.get(
-                "for_loader_criteria", None
-            )
-            is self
-        ):
-            return False
-        return True
-
-    def _resolve_where_criteria(
-        self, ext_info: _InternalEntityType[Any]
-    ) -> ColumnElement[bool]:
-        if self.deferred_where_criteria:
-            crit = cast(
-                "ColumnElement[bool]",
-                self.where_criteria._resolve_with_args(ext_info.entity),
-            )
-        else:
-            crit = self.where_criteria  # type: ignore
-        assert isinstance(crit, ColumnElement)
-        return sql_util._deep_annotate(
-            crit,
-            {"for_loader_criteria": self},
-            detect_subquery_cols=True,
-            ind_cols_on_fromclause=True,
-        )
-
-    def process_compile_state_replaced_entities(
-        self,
-        compile_state: ORMCompileState,
-        mapper_entities: Iterable[_MapperEntity],
-    ) -> None:
-        self.process_compile_state(compile_state)
-
-    def process_compile_state(self, compile_state: ORMCompileState) -> None:
-        """Apply a modification to a given :class:`.CompileState`."""
-
-        # if options to limit the criteria to immediate query only,
-        # use compile_state.attributes instead
-
-        self.get_global_criteria(compile_state.global_attributes)
-
-    def get_global_criteria(self, attributes: Dict[Any, Any]) -> None:
-        for mp in self._all_mappers():
-            load_criteria = attributes.setdefault(
-                ("additional_entity_criteria", mp), []
-            )
-
-            load_criteria.append(self)
-
-
-inspection._inspects(AliasedClass)(lambda target: target._aliased_insp)
-
-
-@inspection._inspects(type)
-def _inspect_mc(
-    class_: Type[_O],
-) -> Optional[Mapper[_O]]:
-    try:
-        class_manager = opt_manager_of_class(class_)
-        if class_manager is None or not class_manager.is_mapped:
-            return None
-        mapper = class_manager.mapper
-    except exc.NO_STATE:
-        return None
-    else:
-        return mapper
-
-
-GenericAlias = type(List[Any])
-
-
-@inspection._inspects(GenericAlias)
-def _inspect_generic_alias(
-    class_: Type[_O],
-) -> Optional[Mapper[_O]]:
-    origin = cast("Type[_O]", get_origin(class_))
-    return _inspect_mc(origin)
-
-
-@inspection._self_inspects
-class Bundle(
-    ORMColumnsClauseRole[_T],
-    SupportsCloneAnnotations,
-    MemoizedHasCacheKey,
-    inspection.Inspectable["Bundle[_T]"],
-    InspectionAttr,
-):
-    """A grouping of SQL expressions that are returned by a :class:`.Query`
-    under one namespace.
-
-    The :class:`.Bundle` essentially allows nesting of the tuple-based
-    results returned by a column-oriented :class:`_query.Query` object.
-    It also
-    is extensible via simple subclassing, where the primary capability
-    to override is that of how the set of expressions should be returned,
-    allowing post-processing as well as custom return types, without
-    involving ORM identity-mapped classes.
-
-    .. seealso::
-
-        :ref:`bundles`
-
-
-    """
-
-    single_entity = False
-    """If True, queries for a single Bundle will be returned as a single
-    entity, rather than an element within a keyed tuple."""
-
-    is_clause_element = False
-
-    is_mapper = False
-
-    is_aliased_class = False
-
-    is_bundle = True
-
-    _propagate_attrs: _PropagateAttrsType = util.immutabledict()
-
-    proxy_set = util.EMPTY_SET  # type: ignore
-
-    exprs: List[_ColumnsClauseElement]
-
-    def __init__(
-        self, name: str, *exprs: _ColumnExpressionArgument[Any], **kw: Any
-    ):
-        r"""Construct a new :class:`.Bundle`.
-
-        e.g.::
-
-            bn = Bundle("mybundle", MyClass.x, MyClass.y)
-
-            for row in session.query(bn).filter(bn.c.x == 5).filter(bn.c.y == 4):
-                print(row.mybundle.x, row.mybundle.y)
-
-        :param name: name of the bundle.
-        :param \*exprs: columns or SQL expressions comprising the bundle.
-        :param single_entity=False: if True, rows for this :class:`.Bundle`
-         can be returned as a "single entity" outside of any enclosing tuple
-         in the same manner as a mapped entity.
-
-        """  # noqa: E501
-        self.name = self._label = name
-        coerced_exprs = [
-            coercions.expect(
-                roles.ColumnsClauseRole, expr, apply_propagate_attrs=self
-            )
-            for expr in exprs
-        ]
-        self.exprs = coerced_exprs
-
-        self.c = self.columns = ColumnCollection(
-            (getattr(col, "key", col._label), col)
-            for col in [e._annotations.get("bundle", e) for e in coerced_exprs]
-        ).as_readonly()
-        self.single_entity = kw.pop("single_entity", self.single_entity)
-
-    def _gen_cache_key(
-        self, anon_map: anon_map, bindparams: List[BindParameter[Any]]
-    ) -> Tuple[Any, ...]:
-        return (self.__class__, self.name, self.single_entity) + tuple(
-            [expr._gen_cache_key(anon_map, bindparams) for expr in self.exprs]
-        )
-
-    @property
-    def mapper(self) -> Optional[Mapper[Any]]:
-        mp: Optional[Mapper[Any]] = self.exprs[0]._annotations.get(
-            "parentmapper", None
-        )
-        return mp
-
-    @property
-    def entity(self) -> Optional[_InternalEntityType[Any]]:
-        ie: Optional[_InternalEntityType[Any]] = self.exprs[
-            0
-        ]._annotations.get("parententity", None)
-        return ie
-
-    @property
-    def entity_namespace(
-        self,
-    ) -> ReadOnlyColumnCollection[str, KeyedColumnElement[Any]]:
-        return self.c
-
-    columns: ReadOnlyColumnCollection[str, KeyedColumnElement[Any]]
-
-    """A namespace of SQL expressions referred to by this :class:`.Bundle`.
-
-        e.g.::
-
-            bn = Bundle("mybundle", MyClass.x, MyClass.y)
-
-            q = sess.query(bn).filter(bn.c.x == 5)
-
-        Nesting of bundles is also supported::
-
-            b1 = Bundle(
-                "b1",
-                Bundle("b2", MyClass.a, MyClass.b),
-                Bundle("b3", MyClass.x, MyClass.y),
-            )
-
-            q = sess.query(b1).filter(b1.c.b2.c.a == 5).filter(b1.c.b3.c.y == 9)
-
-    .. seealso::
-
-        :attr:`.Bundle.c`
-
-    """  # noqa: E501
-
-    c: ReadOnlyColumnCollection[str, KeyedColumnElement[Any]]
-    """An alias for :attr:`.Bundle.columns`."""
-
-    def _clone(self, **kw):
-        cloned = self.__class__.__new__(self.__class__)
-        cloned.__dict__.update(self.__dict__)
-        return cloned
-
-    def __clause_element__(self):
-        # ensure existing entity_namespace remains
-        annotations = {"bundle": self, "entity_namespace": self}
-        annotations.update(self._annotations)
-
-        plugin_subject = self.exprs[0]._propagate_attrs.get(
-            "plugin_subject", self.entity
-        )
-        return (
-            expression.ClauseList(
-                _literal_as_text_role=roles.ColumnsClauseRole,
-                group=False,
-                *[e._annotations.get("bundle", e) for e in self.exprs],
-            )
-            ._annotate(annotations)
-            ._set_propagate_attrs(
-                # the Bundle *must* use the orm plugin no matter what.  the
-                # subject can be None but it's much better if it's not.
-                {
-                    "compile_state_plugin": "orm",
-                    "plugin_subject": plugin_subject,
-                }
-            )
-        )
-
-    @property
-    def clauses(self):
-        return self.__clause_element__().clauses
-
-    def label(self, name):
-        """Provide a copy of this :class:`.Bundle` passing a new label."""
-
-        cloned = self._clone()
-        cloned.name = name
-        return cloned
-
-    def create_row_processor(
-        self,
-        query: Select[Any],
-        procs: Sequence[Callable[[Row[Any]], Any]],
-        labels: Sequence[str],
-    ) -> Callable[[Row[Any]], Any]:
-        """Produce the "row processing" function for this :class:`.Bundle`.
-
-        May be overridden by subclasses to provide custom behaviors when
-        results are fetched. The method is passed the statement object and a
-        set of "row processor" functions at query execution time; these
-        processor functions when given a result row will return the individual
-        attribute value, which can then be adapted into any kind of return data
-        structure.
-
-        The example below illustrates replacing the usual :class:`.Row`
-        return structure with a straight Python dictionary::
-
-            from sqlalchemy.orm import Bundle
-
-
-            class DictBundle(Bundle):
-                def create_row_processor(self, query, procs, labels):
-                    "Override create_row_processor to return values as dictionaries"
-
-                    def proc(row):
-                        return dict(zip(labels, (proc(row) for proc in procs)))
-
-                    return proc
-
-        A result from the above :class:`_orm.Bundle` will return dictionary
-        values::
-
-            bn = DictBundle("mybundle", MyClass.data1, MyClass.data2)
-            for row in session.execute(select(bn)).where(bn.c.data1 == "d1"):
-                print(row.mybundle["data1"], row.mybundle["data2"])
-
-        """  # noqa: E501
-        keyed_tuple = result_tuple(labels, [() for l in labels])
-
-        def proc(row: Row[Any]) -> Any:
-            return keyed_tuple([proc(row) for proc in procs])
-
-        return proc
-
-
-def _orm_annotate(element: _SA, exclude: Optional[Any] = None) -> _SA:
-    """Deep copy the given ClauseElement, annotating each element with the
-    "_orm_adapt" flag.
-
-    Elements within the exclude collection will be cloned but not annotated.
-
-    """
-    return sql_util._deep_annotate(element, {"_orm_adapt": True}, exclude)
-
-
-def _orm_deannotate(element: _SA) -> _SA:
-    """Remove annotations that link a column to a particular mapping.
-
-    Note this doesn't affect "remote" and "foreign" annotations
-    passed by the :func:`_orm.foreign` and :func:`_orm.remote`
-    annotators.
-
-    """
-
-    return sql_util._deep_deannotate(
-        element, values=("_orm_adapt", "parententity")
-    )
-
-
-def _orm_full_deannotate(element: _SA) -> _SA:
-    return sql_util._deep_deannotate(element)
-
-
-class _ORMJoin(expression.Join):
-    """Extend Join to support ORM constructs as input."""
-
-    __visit_name__ = expression.Join.__visit_name__
-
-    inherit_cache = True
-
-    def __init__(
-        self,
-        left: _FromClauseArgument,
-        right: _FromClauseArgument,
-        onclause: Optional[_OnClauseArgument] = None,
-        isouter: bool = False,
-        full: bool = False,
-        _left_memo: Optional[Any] = None,
-        _right_memo: Optional[Any] = None,
-        _extra_criteria: Tuple[ColumnElement[bool], ...] = (),
-    ):
-        left_info = cast(
-            "Union[FromClause, _InternalEntityType[Any]]",
-            inspection.inspect(left),
-        )
-
-        right_info = cast(
-            "Union[FromClause, _InternalEntityType[Any]]",
-            inspection.inspect(right),
-        )
-        adapt_to = right_info.selectable
-
-        # used by joined eager loader
-        self._left_memo = _left_memo
-        self._right_memo = _right_memo
-
-        if isinstance(onclause, attributes.QueryableAttribute):
-            if TYPE_CHECKING:
-                assert isinstance(
-                    onclause.comparator, RelationshipProperty.Comparator
-                )
-            on_selectable = onclause.comparator._source_selectable()
-            prop = onclause.property
-            _extra_criteria += onclause._extra_criteria
-        elif isinstance(onclause, MapperProperty):
-            # used internally by joined eager loader...possibly not ideal
-            prop = onclause
-            on_selectable = prop.parent.selectable
-        else:
-            prop = None
-            on_selectable = None
-
-        left_selectable = left_info.selectable
-        if prop:
-            adapt_from: Optional[FromClause]
-            if sql_util.clause_is_present(on_selectable, left_selectable):
-                adapt_from = on_selectable
-            else:
-                assert isinstance(left_selectable, FromClause)
-                adapt_from = left_selectable
-
-            (
-                pj,
-                sj,
-                source,
-                dest,
-                secondary,
-                target_adapter,
-            ) = prop._create_joins(
-                source_selectable=adapt_from,
-                dest_selectable=adapt_to,
-                source_polymorphic=True,
-                of_type_entity=right_info,
-                alias_secondary=True,
-                extra_criteria=_extra_criteria,
-            )
-
-            if sj is not None:
-                if isouter:
-                    # note this is an inner join from secondary->right
-                    right = sql.join(secondary, right, sj)
-                    onclause = pj
-                else:
-                    left = sql.join(left, secondary, pj, isouter)
-                    onclause = sj
-            else:
-                onclause = pj
-
-            self._target_adapter = target_adapter
-
-        # we don't use the normal coercions logic for _ORMJoin
-        # (probably should), so do some gymnastics to get the entity.
-        # logic here is for #8721, which was a major bug in 1.4
-        # for almost two years, not reported/fixed until 1.4.43 (!)
-        if is_selectable(left_info):
-            parententity = left_selectable._annotations.get(
-                "parententity", None
-            )
-        elif insp_is_mapper(left_info) or insp_is_aliased_class(left_info):
-            parententity = left_info
-        else:
-            parententity = None
-
-        if parententity is not None:
-            self._annotations = self._annotations.union(
-                {"parententity": parententity}
-            )
-
-        augment_onclause = bool(_extra_criteria) and not prop
-        expression.Join.__init__(self, left, right, onclause, isouter, full)
-
-        assert self.onclause is not None
-
-        if augment_onclause:
-            self.onclause &= sql.and_(*_extra_criteria)
-
-        if (
-            not prop
-            and getattr(right_info, "mapper", None)
-            and right_info.mapper.single  # type: ignore
-        ):
-            right_info = cast("_InternalEntityType[Any]", right_info)
-            # if single inheritance target and we are using a manual
-            # or implicit ON clause, augment it the same way we'd augment the
-            # WHERE.
-            single_crit = right_info.mapper._single_table_criterion
-            if single_crit is not None:
-                if insp_is_aliased_class(right_info):
-                    single_crit = right_info._adapter.traverse(single_crit)
-                self.onclause = self.onclause & single_crit
-
-    def _splice_into_center(self, other):
-        """Splice a join into the center.
-
-        Given join(a, b) and join(b, c), return join(a, b).join(c)
-
-        """
-        leftmost = other
-        while isinstance(leftmost, sql.Join):
-            leftmost = leftmost.left
-
-        assert self.right is leftmost
-
-        left = _ORMJoin(
-            self.left,
-            other.left,
-            self.onclause,
-            isouter=self.isouter,
-            _left_memo=self._left_memo,
-            _right_memo=other._left_memo._path_registry,
-        )
-
-        return _ORMJoin(
-            left,
-            other.right,
-            other.onclause,
-            isouter=other.isouter,
-            _right_memo=other._right_memo,
-        )
-
-    def join(
-        self,
-        right: _FromClauseArgument,
-        onclause: Optional[_OnClauseArgument] = None,
-        isouter: bool = False,
-        full: bool = False,
-    ) -> _ORMJoin:
-        return _ORMJoin(self, right, onclause, full=full, isouter=isouter)
-
-    def outerjoin(
-        self,
-        right: _FromClauseArgument,
-        onclause: Optional[_OnClauseArgument] = None,
-        full: bool = False,
-    ) -> _ORMJoin:
-        return _ORMJoin(self, right, onclause, isouter=True, full=full)
-
-
-def with_parent(
-    instance: object,
-    prop: attributes.QueryableAttribute[Any],
-    from_entity: Optional[_EntityType[Any]] = None,
+    from ._typing import _EquivalentColumnMap
+    from ._typing import _LimitOffsetType
+    from ._typing import _TypeEngineArgument
+    from .elements import BinaryExpression
+    from .elements import TextClause
+    from .selectable import _JoinTargetElement
+    from .selectable import _SelectIterable
+    from .selectable import Selectable
+    from .visitors import _TraverseCallableType
+    from .visitors import ExternallyTraversible
+    from .visitors import ExternalTraversal
+    from ..engine.interfaces import _AnyExecuteParams
+    from ..engine.interfaces import _AnyMultiExecuteParams
+    from ..engine.interfaces import _AnySingleExecuteParams
+    from ..engine.interfaces import _CoreSingleExecuteParams
+    from ..engine.row import Row
+
+_CE = TypeVar("_CE", bound="ColumnElement[Any]")
+
+
+def join_condition(
+    a: FromClause,
+    b: FromClause,
+    a_subset: Optional[FromClause] = None,
+    consider_as_foreign_keys: Optional[AbstractSet[ColumnClause[Any]]] = None,
 ) -> ColumnElement[bool]:
-    """Create filtering criterion that relates this query's primary entity
-    to the given related instance, using established
-    :func:`_orm.relationship()`
-    configuration.
-
-    E.g.::
-
-        stmt = select(Address).where(with_parent(some_user, User.addresses))
-
-    The SQL rendered is the same as that rendered when a lazy loader
-    would fire off from the given parent on that attribute, meaning
-    that the appropriate state is taken from the parent object in
-    Python without the need to render joins to the parent table
-    in the rendered statement.
-
-    The given property may also make use of :meth:`_orm.PropComparator.of_type`
-    to indicate the left side of the criteria::
-
-
-        a1 = aliased(Address)
-        a2 = aliased(Address)
-        stmt = select(a1, a2).where(with_parent(u1, User.addresses.of_type(a2)))
-
-    The above use is equivalent to using the
-    :func:`_orm.with_parent.from_entity` argument::
-
-        a1 = aliased(Address)
-        a2 = aliased(Address)
-        stmt = select(a1, a2).where(
-            with_parent(u1, User.addresses, from_entity=a2)
-        )
-
-    :param instance:
-      An instance which has some :func:`_orm.relationship`.
-
-    :param property:
-      Class-bound attribute, which indicates
-      what relationship from the instance should be used to reconcile the
-      parent/child relationship.
-
-    :param from_entity:
-      Entity in which to consider as the left side.  This defaults to the
-      "zero" entity of the :class:`_query.Query` itself.
-
-      .. versionadded:: 1.2
-
-    """  # noqa: E501
-    prop_t: RelationshipProperty[Any]
-
-    if isinstance(prop, str):
-        raise sa_exc.ArgumentError(
-            "with_parent() accepts class-bound mapped attributes, not strings"
-        )
-    elif isinstance(prop, attributes.QueryableAttribute):
-        if prop._of_type:
-            from_entity = prop._of_type
-        mapper_property = prop.property
-        if mapper_property is None or not prop_is_relationship(
-            mapper_property
-        ):
-            raise sa_exc.ArgumentError(
-                f"Expected relationship property for with_parent(), "
-                f"got {mapper_property}"
-            )
-        prop_t = mapper_property
-    else:
-        prop_t = prop
-
-    return prop_t._with_parent(instance, from_entity=from_entity)
-
-
-def has_identity(object_: object) -> bool:
-    """Return True if the given object has a database
-    identity.
-
-    This typically corresponds to the object being
-    in either the persistent or detached state.
-
-    .. seealso::
-
-        :func:`.was_deleted`
-
-    """
-    state = attributes.instance_state(object_)
-    return state.has_identity
-
-
-def was_deleted(object_: object) -> bool:
-    """Return True if the given object was deleted
-    within a session flush.
-
-    This is regardless of whether or not the object is
-    persistent or detached.
-
-    .. seealso::
-
-        :attr:`.InstanceState.was_deleted`
-
-    """
-
-    state = attributes.instance_state(object_)
-    return state.was_deleted
-
-
-def _entity_corresponds_to(
-    given: _InternalEntityType[Any], entity: _InternalEntityType[Any]
-) -> bool:
-    """determine if 'given' corresponds to 'entity', in terms
-    of an entity passed to Query that would match the same entity
-    being referred to elsewhere in the query.
-
-    """
-    if insp_is_aliased_class(entity):
-        if insp_is_aliased_class(given):
-            if entity._base_alias() is given._base_alias():
-                return True
-        return False
-    elif insp_is_aliased_class(given):
-        if given._use_mapper_path:
-            return entity in given.with_polymorphic_mappers
-        else:
-            return entity is given
-
-    assert insp_is_mapper(given)
-    return entity.common_parent(given)
-
-
-def _entity_corresponds_to_use_path_impl(
-    given: _InternalEntityType[Any], entity: _InternalEntityType[Any]
-) -> bool:
-    """determine if 'given' corresponds to 'entity', in terms
-    of a path of loader options where a mapped attribute is taken to
-    be a member of a parent entity.
+    """Create a join condition between two tables or selectables.
 
     e.g.::
 
-        someoption(A).someoption(A.b)  # -> fn(A, A) -> True
-        someoption(A).someoption(C.d)  # -> fn(A, C) -> False
+        join_condition(tablea, tableb)
 
-        a1 = aliased(A)
-        someoption(a1).someoption(A.b)  # -> fn(a1, A) -> False
-        someoption(a1).someoption(a1.b)  # -> fn(a1, a1) -> True
+    would produce an expression along the lines of::
 
-        wp = with_polymorphic(A, [A1, A2])
-        someoption(wp).someoption(A1.foo)  # -> fn(wp, A1) -> False
-        someoption(wp).someoption(wp.A1.foo)  # -> fn(wp, wp.A1) -> True
+        tablea.c.id == tableb.c.tablea_id
+
+    The join is determined based on the foreign key relationships
+    between the two selectables.   If there are multiple ways
+    to join, or no way to join, an error is raised.
+
+    :param a_subset: An optional expression that is a sub-component
+        of ``a``.  An attempt will be made to join to just this sub-component
+        first before looking at the full ``a`` construct, and if found
+        will be successful even if there are other ways to join to ``a``.
+        This allows the "right side" of a join to be passed thereby
+        providing a "natural join".
 
     """
-    if insp_is_aliased_class(given):
-        return (
-            insp_is_aliased_class(entity)
-            and not entity._use_mapper_path
-            and (given is entity or entity in given._with_polymorphic_entities)
-        )
-    elif not insp_is_aliased_class(entity):
-        return given.isa(entity.mapper)
+    return Join._join_condition(
+        a,
+        b,
+        a_subset=a_subset,
+        consider_as_foreign_keys=consider_as_foreign_keys,
+    )
+
+
+def find_join_source(
+    clauses: List[FromClause], join_to: FromClause
+) -> List[int]:
+    """Given a list of FROM clauses and a selectable,
+    return the first index and element from the list of
+    clauses which can be joined against the selectable.  returns
+    None, None if no match is found.
+
+    e.g.::
+
+        clause1 = table1.join(table2)
+        clause2 = table4.join(table5)
+
+        join_to = table2.join(table3)
+
+        find_join_source([clause1, clause2], join_to) == clause1
+
+    """
+
+    selectables = list(_from_objects(join_to))
+    idx = []
+    for i, f in enumerate(clauses):
+        for s in selectables:
+            if f.is_derived_from(s):
+                idx.append(i)
+    return idx
+
+
+def find_left_clause_that_matches_given(
+    clauses: Sequence[FromClause], join_from: FromClause
+) -> List[int]:
+    """Given a list of FROM clauses and a selectable,
+    return the indexes from the list of
+    clauses which is derived from the selectable.
+
+    """
+
+    selectables = list(_from_objects(join_from))
+    liberal_idx = []
+    for i, f in enumerate(clauses):
+        for s in selectables:
+            # basic check, if f is derived from s.
+            # this can be joins containing a table, or an aliased table
+            # or select statement matching to a table.  This check
+            # will match a table to a selectable that is adapted from
+            # that table.  With Query, this suits the case where a join
+            # is being made to an adapted entity
+            if f.is_derived_from(s):
+                liberal_idx.append(i)
+                break
+
+    # in an extremely small set of use cases, a join is being made where
+    # there are multiple FROM clauses where our target table is represented
+    # in more than one, such as embedded or similar.   in this case, do
+    # another pass where we try to get a more exact match where we aren't
+    # looking at adaption relationships.
+    if len(liberal_idx) > 1:
+        conservative_idx = []
+        for idx in liberal_idx:
+            f = clauses[idx]
+            for s in selectables:
+                if set(surface_selectables(f)).intersection(
+                    surface_selectables(s)
+                ):
+                    conservative_idx.append(idx)
+                    break
+        if conservative_idx:
+            return conservative_idx
+
+    return liberal_idx
+
+
+def find_left_clause_to_join_from(
+    clauses: Sequence[FromClause],
+    join_to: _JoinTargetElement,
+    onclause: Optional[ColumnElement[Any]],
+) -> List[int]:
+    """Given a list of FROM clauses, a selectable,
+    and optional ON clause, return a list of integer indexes from the
+    clauses list indicating the clauses that can be joined from.
+
+    The presence of an "onclause" indicates that at least one clause can
+    definitely be joined from; if the list of clauses is of length one
+    and the onclause is given, returns that index.   If the list of clauses
+    is more than length one, and the onclause is given, attempts to locate
+    which clauses contain the same columns.
+
+    """
+    idx = []
+    selectables = set(_from_objects(join_to))
+
+    # if we are given more than one target clause to join
+    # from, use the onclause to provide a more specific answer.
+    # otherwise, don't try to limit, after all, "ON TRUE" is a valid
+    # on clause
+    if len(clauses) > 1 and onclause is not None:
+        resolve_ambiguity = True
+        cols_in_onclause = _find_columns(onclause)
     else:
-        return (
-            entity._use_mapper_path
-            and given in entity.with_polymorphic_mappers
+        resolve_ambiguity = False
+        cols_in_onclause = None
+
+    for i, f in enumerate(clauses):
+        for s in selectables.difference([f]):
+            if resolve_ambiguity:
+                assert cols_in_onclause is not None
+                if set(f.c).union(s.c).issuperset(cols_in_onclause):
+                    idx.append(i)
+                    break
+            elif onclause is not None or Join._can_join(f, s):
+                idx.append(i)
+                break
+
+    if len(idx) > 1:
+        # this is the same "hide froms" logic from
+        # Selectable._get_display_froms
+        toremove = set(
+            chain(*[_expand_cloned(f._hide_froms) for f in clauses])
         )
+        idx = [i for i in idx if clauses[i] not in toremove]
 
-
-def _entity_isa(given: _InternalEntityType[Any], mapper: Mapper[Any]) -> bool:
-    """determine if 'given' "is a" mapper, in terms of the given
-    would load rows of type 'mapper'.
-
-    """
-    if given.is_aliased_class:
-        return mapper in given.with_polymorphic_mappers or given.mapper.isa(
-            mapper
-        )
-    elif given.with_polymorphic_mappers:
-        return mapper in given.with_polymorphic_mappers or given.isa(mapper)
+    # onclause was given and none of them resolved, so assume
+    # all indexes can match
+    if not idx and onclause is not None:
+        return list(range(len(clauses)))
     else:
-        return given.isa(mapper)
+        return idx
 
 
-def _getitem(iterable_query: Query[Any], item: Any) -> Any:
-    """calculate __getitem__ in terms of an iterable query object
-    that also has a slice() method.
+def visit_binary_product(
+    fn: Callable[
+        [BinaryExpression[Any], ColumnElement[Any], ColumnElement[Any]], None
+    ],
+    expr: ColumnElement[Any],
+) -> None:
+    """Produce a traversal of the given expression, delivering
+    column comparisons to the given function.
+
+    The function is of the form::
+
+        def my_fn(binary, left, right): ...
+
+    For each binary expression located which has a
+    comparison operator, the product of "left" and
+    "right" will be delivered to that function,
+    in terms of that binary.
+
+    Hence an expression like::
+
+        and_((a + b) == q + func.sum(e + f), j == r)
+
+    would have the traversal:
+
+    .. sourcecode:: text
+
+        a <eq> q
+        a <eq> e
+        a <eq> f
+        b <eq> q
+        b <eq> e
+        b <eq> f
+        j <eq> r
+
+    That is, every combination of "left" and
+    "right" that doesn't further contain
+    a binary comparison is passed as pairs.
 
     """
+    stack: List[BinaryExpression[Any]] = []
 
-    def _no_negative_indexes():
-        raise IndexError(
-            "negative indexes are not accepted by SQL "
-            "index / slice operators"
-        )
-
-    if isinstance(item, slice):
-        start, stop, step = util.decode_slice(item)
-
-        if (
-            isinstance(stop, int)
-            and isinstance(start, int)
-            and stop - start <= 0
+    def visit(element: ClauseElement) -> Iterator[ColumnElement[Any]]:
+        if isinstance(element, ScalarSelect):
+            # we don't want to dig into correlated subqueries,
+            # those are just column elements by themselves
+            yield element
+        elif element.__visit_name__ == "binary" and operators.is_comparison(
+            element.operator  # type: ignore
         ):
-            return []
+            stack.insert(0, element)  # type: ignore
+            for l in visit(element.left):  # type: ignore
+                for r in visit(element.right):  # type: ignore
+                    fn(stack[0], l, r)
+            stack.pop(0)
+            for elem in element.get_children():
+                visit(elem)
+        else:
+            if isinstance(element, ColumnClause):
+                yield element
+            for elem in element.get_children():
+                yield from visit(elem)
 
-        elif (isinstance(start, int) and start < 0) or (
-            isinstance(stop, int) and stop < 0
+    list(visit(expr))
+    visit = None  # type: ignore  # remove gc cycles
+
+
+def find_tables(
+    clause: ClauseElement,
+    *,
+    check_columns: bool = False,
+    include_aliases: bool = False,
+    include_joins: bool = False,
+    include_selects: bool = False,
+    include_crud: bool = False,
+) -> List[TableClause]:
+    """locate Table objects within the given expression."""
+
+    tables: List[TableClause] = []
+    _visitors: Dict[str, _TraverseCallableType[Any]] = {}
+
+    if include_selects:
+        _visitors["select"] = _visitors["compound_select"] = tables.append
+
+    if include_joins:
+        _visitors["join"] = tables.append
+
+    if include_aliases:
+        _visitors["alias"] = _visitors["subquery"] = _visitors[
+            "tablesample"
+        ] = _visitors["lateral"] = tables.append
+
+    if include_crud:
+        _visitors["insert"] = _visitors["update"] = _visitors["delete"] = (
+            lambda ent: tables.append(ent.table)
+        )
+
+    if check_columns:
+
+        def visit_column(column):
+            tables.append(column.table)
+
+        _visitors["column"] = visit_column
+
+    _visitors["table"] = tables.append
+
+    visitors.traverse(clause, {}, _visitors)
+    return tables
+
+
+def unwrap_order_by(clause: Any) -> Any:
+    """Break up an 'order by' expression into individual column-expressions,
+    without DESC/ASC/NULLS FIRST/NULLS LAST"""
+
+    cols = util.column_set()
+    result = []
+    stack = deque([clause])
+
+    # examples
+    # column -> ASC/DESC == column
+    # column -> ASC/DESC -> label == column
+    # column -> label -> ASC/DESC -> label == column
+    # scalar_select -> label -> ASC/DESC == scalar_select -> label
+
+    while stack:
+        t = stack.popleft()
+        if isinstance(t, ColumnElement) and (
+            not isinstance(t, UnaryExpression)
+            or not operators.is_ordering_modifier(t.modifier)  # type: ignore
         ):
-            _no_negative_indexes()
+            if isinstance(t, Label) and not isinstance(
+                t.element, ScalarSelect
+            ):
+                t = t.element
 
-        res = iterable_query.slice(start, stop)
-        if step is not None:
-            return list(res)[None : None : item.step]
+                if isinstance(t, Grouping):
+                    t = t.element
+
+                stack.append(t)
+                continue
+            elif isinstance(t, _label_reference):
+                t = t.element
+
+                stack.append(t)
+                continue
+            if isinstance(t, (_textual_label_reference)):
+                continue
+            if t not in cols:
+                cols.add(t)
+                result.append(t)
+
         else:
-            return list(res)
-    else:
-        if item == -1:
-            _no_negative_indexes()
-        else:
-            return list(iterable_query[item : item + 1])[0]
+            for c in t.get_children():
+                stack.append(c)
+    return result
 
 
-def _is_mapped_annotation(
-    raw_annotation: _AnnotationScanType,
-    cls: Type[Any],
-    originating_cls: Type[Any],
-) -> bool:
-    try:
-        annotated = de_stringify_annotation(
-            cls, raw_annotation, originating_cls.__module__
-        )
-    except NameError:
-        # in most cases, at least within our own tests, we can raise
-        # here, which is more accurate as it prevents us from returning
-        # false negatives.  However, in the real world, try to avoid getting
-        # involved with end-user annotations that have nothing to do with us.
-        # see issue #8888 where we bypass using this function in the case
-        # that we want to detect an unresolvable Mapped[] type.
-        return False
-    else:
-        return is_origin_of_cls(annotated, _MappedAnnotationBase)
-
-
-class _CleanupError(Exception):
-    pass
-
-
-def _cleanup_mapped_str_annotation(
-    annotation: str, originating_module: str
-) -> str:
-    # fix up an annotation that comes in as the form:
-    # 'Mapped[List[Address]]'  so that it instead looks like:
-    # 'Mapped[List["Address"]]' , which will allow us to get
-    # "Address" as a string
-
-    # additionally, resolve symbols for these names since this is where
-    # we'd have to do it
-
-    inner: Optional[Match[str]]
-
-    mm = re.match(r"^([^ \|]+?)\[(.+)\]$", annotation)
-
-    if not mm:
-        return annotation
-
-    # ticket #8759.  Resolve the Mapped name to a real symbol.
-    # originally this just checked the name.
-    try:
-        obj = eval_name_only(mm.group(1), originating_module)
-    except NameError as ne:
-        raise _CleanupError(
-            f'For annotation "{annotation}", could not resolve '
-            f'container type "{mm.group(1)}".  '
-            "Please ensure this type is imported at the module level "
-            "outside of TYPE_CHECKING blocks"
-        ) from ne
-
-    if obj is typing.ClassVar:
-        real_symbol = "ClassVar"
-    else:
-        try:
-            if issubclass(obj, _MappedAnnotationBase):
-                real_symbol = obj.__name__
-            else:
-                return annotation
-        except TypeError:
-            # avoid isinstance(obj, type) check, just catch TypeError
-            return annotation
-
-    # note: if one of the codepaths above didn't define real_symbol and
-    # then didn't return, real_symbol raises UnboundLocalError
-    # which is actually a NameError, and the calling routines don't
-    # notice this since they are catching NameError anyway.   Just in case
-    # this is being modified in the future, something to be aware of.
-
-    stack = []
-    inner = mm
-    while True:
-        stack.append(real_symbol if mm is inner else inner.group(1))
-        g2 = inner.group(2)
-        inner = re.match(r"^([^ \|]+?)\[(.+)\]$", g2)
-        if inner is None:
-            stack.append(g2)
-            break
-
-    # stacks we want to rewrite, that is, quote the last entry which
-    # we think is a relationship class name:
-    #
-    #   ['Mapped', 'List', 'Address']
-    #   ['Mapped', 'A']
-    #
-    # stacks we dont want to rewrite, which are generally MappedColumn
-    # use cases:
-    #
-    # ['Mapped', "'Optional[Dict[str, str]]'"]
-    # ['Mapped', 'dict[str, str] | None']
-
-    if (
-        # avoid already quoted symbols such as
-        # ['Mapped', "'Optional[Dict[str, str]]'"]
-        not re.match(r"""^["'].*["']$""", stack[-1])
-        # avoid further generics like Dict[] such as
-        # ['Mapped', 'dict[str, str] | None'],
-        # ['Mapped', 'list[int] | list[str]'],
-        # ['Mapped', 'Union[list[int], list[str]]'],
-        and not re.search(r"[\[\]]", stack[-1])
-    ):
-        stripchars = "\"' "
-        stack[-1] = ", ".join(
-            f'"{elem.strip(stripchars)}"' for elem in stack[-1].split(",")
-        )
-
-        annotation = "[".join(stack) + ("]" * (len(stack) - 1))
-
-    return annotation
-
-
-def _extract_mapped_subtype(
-    raw_annotation: Optional[_AnnotationScanType],
-    cls: type,
-    originating_module: str,
-    key: str,
-    attr_cls: Type[Any],
-    required: bool,
-    is_dataclass_field: bool,
-    expect_mapped: bool = True,
-    raiseerr: bool = True,
-) -> Optional[Tuple[Union[_AnnotationScanType, str], Optional[type]]]:
-    """given an annotation, figure out if it's ``Mapped[something]`` and if
-    so, return the ``something`` part.
-
-    Includes error raise scenarios and other options.
-
-    """
-
-    if raw_annotation is None:
-        if required:
-            raise orm_exc.MappedAnnotationError(
-                f"Python typing annotation is required for attribute "
-                f'"{cls.__name__}.{key}" when primary argument(s) for '
-                f'"{attr_cls.__name__}" construct are None or not present'
-            )
+def unwrap_label_reference(element):
+    def replace(
+        element: ExternallyTraversible, **kw: Any
+    ) -> Optional[ExternallyTraversible]:
+        if isinstance(element, _label_reference):
+            return element.element
+        elif isinstance(element, _textual_label_reference):
+            assert False, "can't unwrap a textual label reference"
         return None
 
-    try:
-        # destringify the "outside" of the annotation.  note we are not
-        # adding include_generic so it will *not* dig into generic contents,
-        # which will remain as ForwardRef or plain str under future annotations
-        # mode.  The full destringify happens later when mapped_column goes
-        # to do a full lookup in the registry type_annotations_map.
-        annotated = de_stringify_annotation(
-            cls,
-            raw_annotation,
-            originating_module,
-            str_cleanup_fn=_cleanup_mapped_str_annotation,
-        )
-    except _CleanupError as ce:
-        raise orm_exc.MappedAnnotationError(
-            f"Could not interpret annotation {raw_annotation}.  "
-            "Check that it uses names that are correctly imported at the "
-            "module level. See chained stack trace for more hints."
-        ) from ce
-    except NameError as ne:
-        if raiseerr and "Mapped[" in raw_annotation:  # type: ignore
-            raise orm_exc.MappedAnnotationError(
-                f"Could not interpret annotation {raw_annotation}.  "
-                "Check that it uses names that are correctly imported at the "
-                "module level. See chained stack trace for more hints."
-            ) from ne
+    return visitors.replacement_traverse(element, {}, replace)
 
-        annotated = raw_annotation  # type: ignore
 
-    if is_dataclass_field:
-        return annotated, None
+def expand_column_list_from_order_by(collist, order_by):
+    """Given the columns clause and ORDER BY of a selectable,
+    return a list of column expressions that can be added to the collist
+    corresponding to the ORDER BY, without repeating those already
+    in the collist.
+
+    """
+    cols_already_present = {
+        col.element if col._order_by_label_element is not None else col
+        for col in collist
+    }
+
+    to_look_for = list(chain(*[unwrap_order_by(o) for o in order_by]))
+
+    return [col for col in to_look_for if col not in cols_already_present]
+
+
+def clause_is_present(clause, search):
+    """Given a target clause and a second to search within, return True
+    if the target is plainly present in the search without any
+    subqueries or aliases involved.
+
+    Basically descends through Joins.
+
+    """
+
+    for elem in surface_selectables(search):
+        if clause == elem:  # use == here so that Annotated's compare
+            return True
     else:
-        if not hasattr(annotated, "__origin__") or not is_origin_of_cls(
-            annotated, _MappedAnnotationBase
-        ):
-            if expect_mapped:
-                if not raiseerr:
-                    return None
+        return False
 
-                origin = getattr(annotated, "__origin__", None)
-                if origin is typing.ClassVar:
-                    return None
 
-                # check for other kind of ORM descriptor like AssociationProxy,
-                # don't raise for that (issue #9957)
-                elif isinstance(origin, type) and issubclass(
-                    origin, ORMDescriptor
-                ):
-                    return None
+def tables_from_leftmost(clause: FromClause) -> Iterator[FromClause]:
+    if isinstance(clause, Join):
+        yield from tables_from_leftmost(clause.left)
+        yield from tables_from_leftmost(clause.right)
+    elif isinstance(clause, FromGrouping):
+        yield from tables_from_leftmost(clause.element)
+    else:
+        yield clause
 
-                raise orm_exc.MappedAnnotationError(
-                    f'Type annotation for "{cls.__name__}.{key}" '
-                    "can't be correctly interpreted for "
-                    "Annotated Declarative Table form.  ORM annotations "
-                    "should normally make use of the ``Mapped[]`` generic "
-                    "type, or other ORM-compatible generic type, as a "
-                    "container for the actual type, which indicates the "
-                    "intent that the attribute is mapped. "
-                    "Class variables that are not intended to be mapped "
-                    "by the ORM should use ClassVar[].  "
-                    "To allow Annotated Declarative to disregard legacy "
-                    "annotations which don't use Mapped[] to pass, set "
-                    '"__allow_unmapped__ = True" on the class or a '
-                    "superclass this class.",
-                    code="zlpr",
-                )
 
+def surface_selectables(clause):
+    stack = [clause]
+    while stack:
+        elem = stack.pop()
+        yield elem
+        if isinstance(elem, Join):
+            stack.extend((elem.left, elem.right))
+        elif isinstance(elem, FromGrouping):
+            stack.append(elem.element)
+
+
+def surface_selectables_only(clause: ClauseElement) -> Iterator[ClauseElement]:
+    stack = [clause]
+    while stack:
+        elem = stack.pop()
+        if isinstance(elem, (TableClause, Alias)):
+            yield elem
+        if isinstance(elem, Join):
+            stack.extend((elem.left, elem.right))
+        elif isinstance(elem, FromGrouping):
+            stack.append(elem.element)
+        elif isinstance(elem, ColumnClause):
+            if elem.table is not None:
+                stack.append(elem.table)
             else:
-                return annotated, None
+                yield elem
+        elif elem is not None:
+            yield elem
 
-        if len(annotated.__args__) != 1:
-            raise orm_exc.MappedAnnotationError(
-                "Expected sub-type for Mapped[] annotation"
+
+def extract_first_column_annotation(column, annotation_name):
+    filter_ = (FromGrouping, SelectBase)
+
+    stack = deque([column])
+    while stack:
+        elem = stack.popleft()
+        if annotation_name in elem._annotations:
+            return elem._annotations[annotation_name]
+        for sub in elem.get_children():
+            if isinstance(sub, filter_):
+                continue
+            stack.append(sub)
+    return None
+
+
+def selectables_overlap(left: FromClause, right: FromClause) -> bool:
+    """Return True if left/right have some overlapping selectable"""
+
+    return bool(
+        set(surface_selectables(left)).intersection(surface_selectables(right))
+    )
+
+
+def bind_values(clause):
+    """Return an ordered list of "bound" values in the given clause.
+
+    E.g.::
+
+        >>> expr = and_(table.c.foo == 5, table.c.foo == 7)
+        >>> bind_values(expr)
+        [5, 7]
+    """
+
+    v = []
+
+    def visit_bindparam(bind):
+        v.append(bind.effective_value)
+
+    visitors.traverse(clause, {}, {"bindparam": visit_bindparam})
+    return v
+
+
+def _quote_ddl_expr(element):
+    if isinstance(element, str):
+        element = element.replace("'", "''")
+        return "'%s'" % element
+    else:
+        return repr(element)
+
+
+class _repr_base:
+    _LIST: int = 0
+    _TUPLE: int = 1
+    _DICT: int = 2
+
+    __slots__ = ("max_chars",)
+
+    max_chars: int
+
+    def trunc(self, value: Any) -> str:
+        rep = repr(value)
+        lenrep = len(rep)
+        if lenrep > self.max_chars:
+            segment_length = self.max_chars // 2
+            rep = (
+                rep[0:segment_length]
+                + (
+                    " ... (%d characters truncated) ... "
+                    % (lenrep - self.max_chars)
+                )
+                + rep[-segment_length:]
+            )
+        return rep
+
+
+def _repr_single_value(value):
+    rp = _repr_base()
+    rp.max_chars = 300
+    return rp.trunc(value)
+
+
+class _repr_row(_repr_base):
+    """Provide a string view of a row."""
+
+    __slots__ = ("row",)
+
+    def __init__(self, row: Row[Any], max_chars: int = 300):
+        self.row = row
+        self.max_chars = max_chars
+
+    def __repr__(self) -> str:
+        trunc = self.trunc
+        return "(%s%s)" % (
+            ", ".join(trunc(value) for value in self.row),
+            "," if len(self.row) == 1 else "",
+        )
+
+
+class _long_statement(str):
+    def __str__(self) -> str:
+        lself = len(self)
+        if lself > 500:
+            lleft = 250
+            lright = 100
+            trunc = lself - lleft - lright
+            return (
+                f"{self[0:lleft]} ... {trunc} "
+                f"characters truncated ... {self[-lright:]}"
+            )
+        else:
+            return str.__str__(self)
+
+
+class _repr_params(_repr_base):
+    """Provide a string view of bound parameters.
+
+    Truncates display to a given number of 'multi' parameter sets,
+    as well as long values to a given number of characters.
+
+    """
+
+    __slots__ = "params", "batches", "ismulti", "max_params"
+
+    def __init__(
+        self,
+        params: Optional[_AnyExecuteParams],
+        batches: int,
+        max_params: int = 100,
+        max_chars: int = 300,
+        ismulti: Optional[bool] = None,
+    ):
+        self.params = params
+        self.ismulti = ismulti
+        self.batches = batches
+        self.max_chars = max_chars
+        self.max_params = max_params
+
+    def __repr__(self) -> str:
+        if self.ismulti is None:
+            return self.trunc(self.params)
+
+        if isinstance(self.params, list):
+            typ = self._LIST
+
+        elif isinstance(self.params, tuple):
+            typ = self._TUPLE
+        elif isinstance(self.params, dict):
+            typ = self._DICT
+        else:
+            return self.trunc(self.params)
+
+        if self.ismulti:
+            multi_params = cast(
+                "_AnyMultiExecuteParams",
+                self.params,
             )
 
-        return (
-            # fix dict/list/set args to be ForwardRef, see #11814
-            fixup_container_fwd_refs(annotated.__args__[0]),
-            annotated.__origin__,
+            if len(self.params) > self.batches:
+                msg = (
+                    " ... displaying %i of %i total bound parameter sets ... "
+                )
+                return " ".join(
+                    (
+                        self._repr_multi(
+                            multi_params[: self.batches - 2],
+                            typ,
+                        )[0:-1],
+                        msg % (self.batches, len(self.params)),
+                        self._repr_multi(multi_params[-2:], typ)[1:],
+                    )
+                )
+            else:
+                return self._repr_multi(multi_params, typ)
+        else:
+            return self._repr_params(
+                cast(
+                    "_AnySingleExecuteParams",
+                    self.params,
+                ),
+                typ,
+            )
+
+    def _repr_multi(
+        self,
+        multi_params: _AnyMultiExecuteParams,
+        typ: int,
+    ) -> str:
+        if multi_params:
+            if isinstance(multi_params[0], list):
+                elem_type = self._LIST
+            elif isinstance(multi_params[0], tuple):
+                elem_type = self._TUPLE
+            elif isinstance(multi_params[0], dict):
+                elem_type = self._DICT
+            else:
+                assert False, "Unknown parameter type %s" % (
+                    type(multi_params[0])
+                )
+
+            elements = ", ".join(
+                self._repr_params(params, elem_type) for params in multi_params
+            )
+        else:
+            elements = ""
+
+        if typ == self._LIST:
+            return "[%s]" % elements
+        else:
+            return "(%s)" % elements
+
+    def _get_batches(self, params: Iterable[Any]) -> Any:
+        lparams = list(params)
+        lenparams = len(lparams)
+        if lenparams > self.max_params:
+            lleft = self.max_params // 2
+            return (
+                lparams[0:lleft],
+                lparams[-lleft:],
+                lenparams - self.max_params,
+            )
+        else:
+            return lparams, None, None
+
+    def _repr_params(
+        self,
+        params: _AnySingleExecuteParams,
+        typ: int,
+    ) -> str:
+        if typ is self._DICT:
+            return self._repr_param_dict(
+                cast("_CoreSingleExecuteParams", params)
+            )
+        elif typ is self._TUPLE:
+            return self._repr_param_tuple(cast("Sequence[Any]", params))
+        else:
+            return self._repr_param_list(params)
+
+    def _repr_param_dict(self, params: _CoreSingleExecuteParams) -> str:
+        trunc = self.trunc
+        (
+            items_first_batch,
+            items_second_batch,
+            trunclen,
+        ) = self._get_batches(params.items())
+
+        if items_second_batch:
+            text = "{%s" % (
+                ", ".join(
+                    f"{key!r}: {trunc(value)}"
+                    for key, value in items_first_batch
+                )
+            )
+            text += f" ... {trunclen} parameters truncated ... "
+            text += "%s}" % (
+                ", ".join(
+                    f"{key!r}: {trunc(value)}"
+                    for key, value in items_second_batch
+                )
+            )
+        else:
+            text = "{%s}" % (
+                ", ".join(
+                    f"{key!r}: {trunc(value)}"
+                    for key, value in items_first_batch
+                )
+            )
+        return text
+
+    def _repr_param_tuple(self, params: Sequence[Any]) -> str:
+        trunc = self.trunc
+
+        (
+            items_first_batch,
+            items_second_batch,
+            trunclen,
+        ) = self._get_batches(params)
+
+        if items_second_batch:
+            text = "(%s" % (
+                ", ".join(trunc(value) for value in items_first_batch)
+            )
+            text += f" ... {trunclen} parameters truncated ... "
+            text += "%s)" % (
+                ", ".join(trunc(value) for value in items_second_batch),
+            )
+        else:
+            text = "(%s%s)" % (
+                ", ".join(trunc(value) for value in items_first_batch),
+                "," if len(items_first_batch) == 1 else "",
+            )
+        return text
+
+    def _repr_param_list(self, params: _AnySingleExecuteParams) -> str:
+        trunc = self.trunc
+        (
+            items_first_batch,
+            items_second_batch,
+            trunclen,
+        ) = self._get_batches(params)
+
+        if items_second_batch:
+            text = "[%s" % (
+                ", ".join(trunc(value) for value in items_first_batch)
+            )
+            text += f" ... {trunclen} parameters truncated ... "
+            text += "%s]" % (
+                ", ".join(trunc(value) for value in items_second_batch)
+            )
+        else:
+            text = "[%s]" % (
+                ", ".join(trunc(value) for value in items_first_batch)
+            )
+        return text
+
+
+def adapt_criterion_to_null(crit: _CE, nulls: Collection[Any]) -> _CE:
+    """given criterion containing bind params, convert selected elements
+    to IS NULL.
+
+    """
+
+    def visit_binary(binary):
+        if (
+            isinstance(binary.left, BindParameter)
+            and binary.left._identifying_key in nulls
+        ):
+            # reverse order if the NULL is on the left side
+            binary.left = binary.right
+            binary.right = Null()
+            binary.operator = operators.is_
+            binary.negate = operators.is_not
+        elif (
+            isinstance(binary.right, BindParameter)
+            and binary.right._identifying_key in nulls
+        ):
+            binary.right = Null()
+            binary.operator = operators.is_
+            binary.negate = operators.is_not
+
+    return visitors.cloned_traverse(crit, {}, {"binary": visit_binary})
+
+
+def splice_joins(
+    left: Optional[FromClause],
+    right: Optional[FromClause],
+    stop_on: Optional[FromClause] = None,
+) -> Optional[FromClause]:
+    if left is None:
+        return right
+
+    stack: List[Tuple[Optional[FromClause], Optional[Join]]] = [(right, None)]
+
+    adapter = ClauseAdapter(left)
+    ret = None
+    while stack:
+        (right, prevright) = stack.pop()
+        if isinstance(right, Join) and right is not stop_on:
+            right = right._clone()
+            right.onclause = adapter.traverse(right.onclause)
+            stack.append((right.left, right))
+        else:
+            right = adapter.traverse(right)
+        if prevright is not None:
+            assert right is not None
+            prevright.left = right
+        if ret is None:
+            ret = right
+
+    return ret
+
+
+@overload
+def reduce_columns(
+    columns: Iterable[ColumnElement[Any]],
+    *clauses: Optional[ClauseElement],
+    **kw: bool,
+) -> Sequence[ColumnElement[Any]]: ...
+
+
+@overload
+def reduce_columns(
+    columns: _SelectIterable,
+    *clauses: Optional[ClauseElement],
+    **kw: bool,
+) -> Sequence[Union[ColumnElement[Any], TextClause]]: ...
+
+
+def reduce_columns(
+    columns: _SelectIterable,
+    *clauses: Optional[ClauseElement],
+    **kw: bool,
+) -> Collection[Union[ColumnElement[Any], TextClause]]:
+    r"""given a list of columns, return a 'reduced' set based on natural
+    equivalents.
+
+    the set is reduced to the smallest list of columns which have no natural
+    equivalent present in the list.  A "natural equivalent" means that two
+    columns will ultimately represent the same value because they are related
+    by a foreign key.
+
+    \*clauses is an optional list of join clauses which will be traversed
+    to further identify columns that are "equivalent".
+
+    \**kw may specify 'ignore_nonexistent_tables' to ignore foreign keys
+    whose tables are not yet configured, or columns that aren't yet present.
+
+    This function is primarily used to determine the most minimal "primary
+    key" from a selectable, by reducing the set of primary key columns present
+    in the selectable to just those that are not repeated.
+
+    """
+    ignore_nonexistent_tables = kw.pop("ignore_nonexistent_tables", False)
+    only_synonyms = kw.pop("only_synonyms", False)
+
+    column_set = util.OrderedSet(columns)
+    cset_no_text: util.OrderedSet[ColumnElement[Any]] = column_set.difference(
+        c for c in column_set if is_text_clause(c)  # type: ignore
+    )
+
+    omit = util.column_set()
+    for col in cset_no_text:
+        for fk in chain(*[c.foreign_keys for c in col.proxy_set]):
+            for c in cset_no_text:
+                if c is col:
+                    continue
+                try:
+                    fk_col = fk.column
+                except exc.NoReferencedColumnError:
+                    # TODO: add specific coverage here
+                    # to test/sql/test_selectable ReduceTest
+                    if ignore_nonexistent_tables:
+                        continue
+                    else:
+                        raise
+                except exc.NoReferencedTableError:
+                    # TODO: add specific coverage here
+                    # to test/sql/test_selectable ReduceTest
+                    if ignore_nonexistent_tables:
+                        continue
+                    else:
+                        raise
+                if fk_col.shares_lineage(c) and (
+                    not only_synonyms or c.name == col.name
+                ):
+                    omit.add(col)
+                    break
+
+    if clauses:
+
+        def visit_binary(binary):
+            if binary.operator == operators.eq:
+                cols = util.column_set(
+                    chain(
+                        *[c.proxy_set for c in cset_no_text.difference(omit)]
+                    )
+                )
+                if binary.left in cols and binary.right in cols:
+                    for c in reversed(cset_no_text):
+                        if c.shares_lineage(binary.right) and (
+                            not only_synonyms or c.name == binary.left.name
+                        ):
+                            omit.add(c)
+                            break
+
+        for clause in clauses:
+            if clause is not None:
+                visitors.traverse(clause, {}, {"binary": visit_binary})
+
+    return column_set.difference(omit)
+
+
+def criterion_as_pairs(
+    expression,
+    consider_as_foreign_keys=None,
+    consider_as_referenced_keys=None,
+    any_operator=False,
+):
+    """traverse an expression and locate binary criterion pairs."""
+
+    if consider_as_foreign_keys and consider_as_referenced_keys:
+        raise exc.ArgumentError(
+            "Can only specify one of "
+            "'consider_as_foreign_keys' or "
+            "'consider_as_referenced_keys'"
+        )
+
+    def col_is(a, b):
+        # return a is b
+        return a.compare(b)
+
+    def visit_binary(binary):
+        if not any_operator and binary.operator is not operators.eq:
+            return
+        if not isinstance(binary.left, ColumnElement) or not isinstance(
+            binary.right, ColumnElement
+        ):
+            return
+
+        if consider_as_foreign_keys:
+            if binary.left in consider_as_foreign_keys and (
+                col_is(binary.right, binary.left)
+                or binary.right not in consider_as_foreign_keys
+            ):
+                pairs.append((binary.right, binary.left))
+            elif binary.right in consider_as_foreign_keys and (
+                col_is(binary.left, binary.right)
+                or binary.left not in consider_as_foreign_keys
+            ):
+                pairs.append((binary.left, binary.right))
+        elif consider_as_referenced_keys:
+            if binary.left in consider_as_referenced_keys and (
+                col_is(binary.right, binary.left)
+                or binary.right not in consider_as_referenced_keys
+            ):
+                pairs.append((binary.left, binary.right))
+            elif binary.right in consider_as_referenced_keys and (
+                col_is(binary.left, binary.right)
+                or binary.left not in consider_as_referenced_keys
+            ):
+                pairs.append((binary.right, binary.left))
+        else:
+            if isinstance(binary.left, Column) and isinstance(
+                binary.right, Column
+            ):
+                if binary.left.references(binary.right):
+                    pairs.append((binary.right, binary.left))
+                elif binary.right.references(binary.left):
+                    pairs.append((binary.left, binary.right))
+
+    pairs: List[Tuple[ColumnElement[Any], ColumnElement[Any]]] = []
+    visitors.traverse(expression, {}, {"binary": visit_binary})
+    return pairs
+
+
+class ClauseAdapter(visitors.ReplacingExternalTraversal):
+    """Clones and modifies clauses based on column correspondence.
+
+    E.g.::
+
+      table1 = Table(
+          "sometable",
+          metadata,
+          Column("col1", Integer),
+          Column("col2", Integer),
+      )
+      table2 = Table(
+          "someothertable",
+          metadata,
+          Column("col1", Integer),
+          Column("col2", Integer),
+      )
+
+      condition = table1.c.col1 == table2.c.col1
+
+    make an alias of table1::
+
+      s = table1.alias("foo")
+
+    calling ``ClauseAdapter(s).traverse(condition)`` converts
+    condition to read::
+
+      s.c.col1 == table2.c.col1
+
+    """
+
+    __slots__ = (
+        "__traverse_options__",
+        "selectable",
+        "include_fn",
+        "exclude_fn",
+        "equivalents",
+        "adapt_on_names",
+        "adapt_from_selectables",
+    )
+
+    def __init__(
+        self,
+        selectable: Selectable,
+        equivalents: Optional[_EquivalentColumnMap] = None,
+        include_fn: Optional[Callable[[ClauseElement], bool]] = None,
+        exclude_fn: Optional[Callable[[ClauseElement], bool]] = None,
+        adapt_on_names: bool = False,
+        anonymize_labels: bool = False,
+        adapt_from_selectables: Optional[AbstractSet[FromClause]] = None,
+    ):
+        self.__traverse_options__ = {
+            "stop_on": [selectable],
+            "anonymize_labels": anonymize_labels,
+        }
+        self.selectable = selectable
+        self.include_fn = include_fn
+        self.exclude_fn = exclude_fn
+        self.equivalents = util.column_dict(equivalents or {})
+        self.adapt_on_names = adapt_on_names
+        self.adapt_from_selectables = adapt_from_selectables
+
+    if TYPE_CHECKING:
+
+        @overload
+        def traverse(self, obj: Literal[None]) -> None: ...
+
+        # note this specializes the ReplacingExternalTraversal.traverse()
+        # method to state
+        # that we will return the same kind of ExternalTraversal object as
+        # we were given.  This is probably not 100% true, such as it's
+        # possible for us to swap out Alias for Table at the top level.
+        # Ideally there could be overloads specific to ColumnElement and
+        # FromClause but Mypy is not accepting those as compatible with
+        # the base ReplacingExternalTraversal
+        @overload
+        def traverse(self, obj: _ET) -> _ET: ...
+
+        def traverse(
+            self, obj: Optional[ExternallyTraversible]
+        ) -> Optional[ExternallyTraversible]: ...
+
+    def _corresponding_column(
+        self, col, require_embedded, _seen=util.EMPTY_SET
+    ):
+        newcol = self.selectable.corresponding_column(
+            col, require_embedded=require_embedded
+        )
+        if newcol is None and col in self.equivalents and col not in _seen:
+            for equiv in self.equivalents[col]:
+                newcol = self._corresponding_column(
+                    equiv,
+                    require_embedded=require_embedded,
+                    _seen=_seen.union([col]),
+                )
+                if newcol is not None:
+                    return newcol
+
+        if (
+            self.adapt_on_names
+            and newcol is None
+            and isinstance(col, NamedColumn)
+        ):
+            newcol = self.selectable.exported_columns.get(col.name)
+        return newcol
+
+    @util.preload_module("sqlalchemy.sql.functions")
+    def replace(
+        self, col: _ET, _include_singleton_constants: bool = False
+    ) -> Optional[_ET]:
+        functions = util.preloaded.sql_functions
+
+        # TODO: cython candidate
+
+        if self.include_fn and not self.include_fn(col):  # type: ignore
+            return None
+        elif self.exclude_fn and self.exclude_fn(col):  # type: ignore
+            return None
+
+        if isinstance(col, FromClause) and not isinstance(
+            col, functions.FunctionElement
+        ):
+            if self.selectable.is_derived_from(col):
+                if self.adapt_from_selectables:
+                    for adp in self.adapt_from_selectables:
+                        if adp.is_derived_from(col):
+                            break
+                    else:
+                        return None
+                return self.selectable  # type: ignore
+            elif isinstance(col, Alias) and isinstance(
+                col.element, TableClause
+            ):
+                # we are a SELECT statement and not derived from an alias of a
+                # table (which nonetheless may be a table our SELECT derives
+                # from), so return the alias to prevent further traversal
+                # or
+                # we are an alias of a table and we are not derived from an
+                # alias of a table (which nonetheless may be the same table
+                # as ours) so, same thing
+                return col  # type: ignore
+            else:
+                # other cases where we are a selectable and the element
+                # is another join or selectable that contains a table which our
+                # selectable derives from, that we want to process
+                return None
+
+        elif not isinstance(col, ColumnElement):
+            return None
+        elif not _include_singleton_constants and col._is_singleton_constant:
+            # dont swap out NULL, TRUE, FALSE for a label name
+            # in a SQL statement that's being rewritten,
+            # leave them as the constant.  This is first noted in #6259,
+            # however the logic to check this moved here as of #7154 so that
+            # it is made specific to SQL rewriting and not all column
+            # correspondence
+
+            return None
+
+        if "adapt_column" in col._annotations:
+            col = col._annotations["adapt_column"]
+
+        if TYPE_CHECKING:
+            assert isinstance(col, KeyedColumnElement)
+
+        if self.adapt_from_selectables and col not in self.equivalents:
+            for adp in self.adapt_from_selectables:
+                if adp.c.corresponding_column(col, False) is not None:
+                    break
+            else:
+                return None
+
+        if TYPE_CHECKING:
+            assert isinstance(col, KeyedColumnElement)
+
+        return self._corresponding_column(  # type: ignore
+            col, require_embedded=True
         )
 
 
-def _mapper_property_as_plain_name(prop: Type[Any]) -> str:
-    if hasattr(prop, "_mapper_property_name"):
-        name = prop._mapper_property_name()
+class _ColumnLookup(Protocol):
+    @overload
+    def __getitem__(self, key: None) -> None: ...
+
+    @overload
+    def __getitem__(self, key: ColumnClause[Any]) -> ColumnClause[Any]: ...
+
+    @overload
+    def __getitem__(self, key: ColumnElement[Any]) -> ColumnElement[Any]: ...
+
+    @overload
+    def __getitem__(self, key: _ET) -> _ET: ...
+
+    def __getitem__(self, key: Any) -> Any: ...
+
+
+class ColumnAdapter(ClauseAdapter):
+    """Extends ClauseAdapter with extra utility functions.
+
+    Key aspects of ColumnAdapter include:
+
+    * Expressions that are adapted are stored in a persistent
+      .columns collection; so that an expression E adapted into
+      an expression E1, will return the same object E1 when adapted
+      a second time.   This is important in particular for things like
+      Label objects that are anonymized, so that the ColumnAdapter can
+      be used to present a consistent "adapted" view of things.
+
+    * Exclusion of items from the persistent collection based on
+      include/exclude rules, but also independent of hash identity.
+      This because "annotated" items all have the same hash identity as their
+      parent.
+
+    * "wrapping" capability is added, so that the replacement of an expression
+      E can proceed through a series of adapters.  This differs from the
+      visitor's "chaining" feature in that the resulting object is passed
+      through all replacing functions unconditionally, rather than stopping
+      at the first one that returns non-None.
+
+    * An adapt_required option, used by eager loading to indicate that
+      We don't trust a result row column that is not translated.
+      This is to prevent a column from being interpreted as that
+      of the child row in a self-referential scenario, see
+      inheritance/test_basic.py->EagerTargetingTest.test_adapt_stringency
+
+    """
+
+    __slots__ = (
+        "columns",
+        "adapt_required",
+        "allow_label_resolve",
+        "_wrap",
+        "__weakref__",
+    )
+
+    columns: _ColumnLookup
+
+    def __init__(
+        self,
+        selectable: Selectable,
+        equivalents: Optional[_EquivalentColumnMap] = None,
+        adapt_required: bool = False,
+        include_fn: Optional[Callable[[ClauseElement], bool]] = None,
+        exclude_fn: Optional[Callable[[ClauseElement], bool]] = None,
+        adapt_on_names: bool = False,
+        allow_label_resolve: bool = True,
+        anonymize_labels: bool = False,
+        adapt_from_selectables: Optional[AbstractSet[FromClause]] = None,
+    ):
+        super().__init__(
+            selectable,
+            equivalents,
+            include_fn=include_fn,
+            exclude_fn=exclude_fn,
+            adapt_on_names=adapt_on_names,
+            anonymize_labels=anonymize_labels,
+            adapt_from_selectables=adapt_from_selectables,
+        )
+
+        self.columns = util.WeakPopulateDict(self._locate_col)  # type: ignore
+        if self.include_fn or self.exclude_fn:
+            self.columns = self._IncludeExcludeMapping(self, self.columns)
+        self.adapt_required = adapt_required
+        self.allow_label_resolve = allow_label_resolve
+        self._wrap = None
+
+    class _IncludeExcludeMapping:
+        def __init__(self, parent, columns):
+            self.parent = parent
+            self.columns = columns
+
+        def __getitem__(self, key):
+            if (
+                self.parent.include_fn and not self.parent.include_fn(key)
+            ) or (self.parent.exclude_fn and self.parent.exclude_fn(key)):
+                if self.parent._wrap:
+                    return self.parent._wrap.columns[key]
+                else:
+                    return key
+            return self.columns[key]
+
+    def wrap(self, adapter):
+        ac = copy.copy(self)
+        ac._wrap = adapter
+        ac.columns = util.WeakPopulateDict(ac._locate_col)  # type: ignore
+        if ac.include_fn or ac.exclude_fn:
+            ac.columns = self._IncludeExcludeMapping(ac, ac.columns)
+
+        return ac
+
+    @overload
+    def traverse(self, obj: Literal[None]) -> None: ...
+
+    @overload
+    def traverse(self, obj: _ET) -> _ET: ...
+
+    def traverse(
+        self, obj: Optional[ExternallyTraversible]
+    ) -> Optional[ExternallyTraversible]:
+        return self.columns[obj]
+
+    def chain(self, visitor: ExternalTraversal) -> ColumnAdapter:
+        assert isinstance(visitor, ColumnAdapter)
+
+        return super().chain(visitor)
+
+    if TYPE_CHECKING:
+
+        @property
+        def visitor_iterator(self) -> Iterator[ColumnAdapter]: ...
+
+    adapt_clause = traverse
+    adapt_list = ClauseAdapter.copy_and_process
+
+    def adapt_check_present(
+        self, col: ColumnElement[Any]
+    ) -> Optional[ColumnElement[Any]]:
+        newcol = self.columns[col]
+
+        if newcol is col and self._corresponding_column(col, True) is None:
+            return None
+
+        return newcol
+
+    def _locate_col(
+        self, col: ColumnElement[Any]
+    ) -> Optional[ColumnElement[Any]]:
+        # both replace and traverse() are overly complicated for what
+        # we are doing here and we would do better to have an inlined
+        # version that doesn't build up as much overhead.  the issue is that
+        # sometimes the lookup does in fact have to adapt the insides of
+        # say a labeled scalar subquery.   However, if the object is an
+        # Immutable, i.e. Column objects, we can skip the "clone" /
+        # "copy internals" part since those will be no-ops in any case.
+        # additionally we want to catch singleton objects null/true/false
+        # and make sure they are adapted as well here.
+
+        if col._is_immutable:
+            for vis in self.visitor_iterator:
+                c = vis.replace(col, _include_singleton_constants=True)
+                if c is not None:
+                    break
+            else:
+                c = col
+        else:
+            c = ClauseAdapter.traverse(self, col)
+
+        if self._wrap:
+            c2 = self._wrap._locate_col(c)
+            if c2 is not None:
+                c = c2
+
+        if self.adapt_required and c is col:
+            return None
+
+        # allow_label_resolve is consumed by one case for joined eager loading
+        # as part of its logic to prevent its own columns from being affected
+        # by .order_by().  Before full typing were applied to the ORM, this
+        # logic would set this attribute on the incoming object (which is
+        # typically a column, but we have a test for it being a non-column
+        # object) if no column were found.  While this seemed to
+        # have no negative effects, this adjustment should only occur on the
+        # new column which is assumed to be local to an adapted selectable.
+        if c is not col:
+            c._allow_label_resolve = self.allow_label_resolve
+
+        return c
+
+
+def _offset_or_limit_clause(
+    element: _LimitOffsetType,
+    name: Optional[str] = None,
+    type_: Optional[_TypeEngineArgument[int]] = None,
+) -> ColumnElement[int]:
+    """Convert the given value to an "offset or limit" clause.
+
+    This handles incoming integers and converts to an expression; if
+    an expression is already given, it is passed through.
+
+    """
+    return coercions.expect(
+        roles.LimitOffsetRole, element, name=name, type_=type_
+    )
+
+
+def _offset_or_limit_clause_asint_if_possible(
+    clause: _LimitOffsetType,
+) -> _LimitOffsetType:
+    """Return the offset or limit clause as a simple integer if possible,
+    else return the clause.
+
+    """
+    if clause is None:
+        return None
+    if hasattr(clause, "_limit_offset_value"):
+        value = clause._limit_offset_value
+        return util.asint(value)
     else:
-        name = None
-    return util.clsname_as_plain_name(prop, name)
+        return clause
+
+
+def _make_slice(
+    limit_clause: _LimitOffsetType,
+    offset_clause: _LimitOffsetType,
+    start: int,
+    stop: int,
+) -> Tuple[Optional[ColumnElement[int]], Optional[ColumnElement[int]]]:
+    """Compute LIMIT/OFFSET in terms of slice start/end"""
+
+    # for calculated limit/offset, try to do the addition of
+    # values to offset in Python, however if a SQL clause is present
+    # then the addition has to be on the SQL side.
+
+    # TODO: typing is finding a few gaps in here, see if they can be
+    # closed up
+
+    if start is not None and stop is not None:
+        offset_clause = _offset_or_limit_clause_asint_if_possible(
+            offset_clause
+        )
+        if offset_clause is None:
+            offset_clause = 0
+
+        if start != 0:
+            offset_clause = offset_clause + start  # type: ignore
+
+        if offset_clause == 0:
+            offset_clause = None
+        else:
+            assert offset_clause is not None
+            offset_clause = _offset_or_limit_clause(offset_clause)
+
+        limit_clause = _offset_or_limit_clause(stop - start)
+
+    elif start is None and stop is not None:
+        limit_clause = _offset_or_limit_clause(stop)
+    elif start is not None and stop is None:
+        offset_clause = _offset_or_limit_clause_asint_if_possible(
+            offset_clause
+        )
+        if offset_clause is None:
+            offset_clause = 0
+
+        if start != 0:
+            offset_clause = offset_clause + start
+
+        if offset_clause == 0:
+            offset_clause = None
+        else:
+            offset_clause = _offset_or_limit_clause(offset_clause)
+
+    return limit_clause, offset_clause

@@ -1,74 +1,75 @@
-# engine/_py_util.py
+# sql/_py_util.py
 # Copyright (C) 2005-2025 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+
 from __future__ import annotations
 
 import typing
 from typing import Any
-from typing import Mapping
-from typing import Optional
+from typing import Dict
 from typing import Tuple
+from typing import Union
 
-from .. import exc
+from ..util.typing import Literal
 
 if typing.TYPE_CHECKING:
-    from .interfaces import _CoreAnyExecuteParams
-    from .interfaces import _CoreMultiExecuteParams
-    from .interfaces import _DBAPIAnyExecuteParams
-    from .interfaces import _DBAPIMultiExecuteParams
+    from .cache_key import CacheConst
 
 
-_no_tuple: Tuple[Any, ...] = ()
+class prefix_anon_map(Dict[str, str]):
+    """A map that creates new keys for missing key access.
+
+    Considers keys of the form "<ident> <name>" to produce
+    new symbols "<name>_<index>", where "index" is an incrementing integer
+    corresponding to <name>.
+
+    Inlines the approach taken by :class:`sqlalchemy.util.PopulateDict` which
+    is otherwise usually used for this type of operation.
+
+    """
+
+    def __missing__(self, key: str) -> str:
+        (ident, derived) = key.split(" ", 1)
+        anonymous_counter = self.get(derived, 1)
+        self[derived] = anonymous_counter + 1  # type: ignore
+        value = f"{derived}_{anonymous_counter}"
+        self[key] = value
+        return value
 
 
-def _distill_params_20(
-    params: Optional[_CoreAnyExecuteParams],
-) -> _CoreMultiExecuteParams:
-    if params is None:
-        return _no_tuple
-    # Assume list is more likely than tuple
-    elif isinstance(params, list) or isinstance(params, tuple):
-        # collections_abc.MutableSequence): # avoid abc.__instancecheck__
-        if params and not isinstance(params[0], (tuple, Mapping)):
-            raise exc.ArgumentError(
-                "List argument must consist only of tuples or dictionaries"
-            )
+class cache_anon_map(
+    Dict[Union[int, "Literal[CacheConst.NO_CACHE]"], Union[Literal[True], str]]
+):
+    """A map that creates new keys for missing key access.
 
-        return params
-    elif isinstance(params, dict) or isinstance(
-        # only do immutabledict or abc.__instancecheck__ for Mapping after
-        # we've checked for plain dictionaries and would otherwise raise
-        params,
-        Mapping,
-    ):
-        return [params]
-    else:
-        raise exc.ArgumentError("mapping or list expected for parameters")
+    Produces an incrementing sequence given a series of unique keys.
 
+    This is similar to the compiler prefix_anon_map class although simpler.
 
-def _distill_raw_params(
-    params: Optional[_DBAPIAnyExecuteParams],
-) -> _DBAPIMultiExecuteParams:
-    if params is None:
-        return _no_tuple
-    elif isinstance(params, list):
-        # collections_abc.MutableSequence): # avoid abc.__instancecheck__
-        if params and not isinstance(params[0], (tuple, Mapping)):
-            raise exc.ArgumentError(
-                "List argument must consist only of tuples or dictionaries"
-            )
+    Inlines the approach taken by :class:`sqlalchemy.util.PopulateDict` which
+    is otherwise usually used for this type of operation.
 
-        return params
-    elif isinstance(params, (tuple, dict)) or isinstance(
-        # only do abc.__instancecheck__ for Mapping after we've checked
-        # for plain dictionaries and would otherwise raise
-        params,
-        Mapping,
-    ):
-        # cast("Union[List[Mapping[str, Any]], Tuple[Any, ...]]", [params])
-        return [params]  # type: ignore
-    else:
-        raise exc.ArgumentError("mapping or sequence expected for parameters")
+    """
+
+    _index = 0
+
+    def get_anon(self, object_: Any) -> Tuple[str, bool]:
+        idself = id(object_)
+        if idself in self:
+            s_val = self[idself]
+            assert s_val is not True
+            return s_val, True
+        else:
+            # inline of __missing__
+            self[idself] = id_ = str(self._index)
+            self._index += 1
+
+            return id_, False
+
+    def __missing__(self, key: int) -> str:
+        self[key] = val = str(self._index)
+        self._index += 1
+        return val
