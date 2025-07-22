@@ -1,3 +1,5 @@
-[babel.extractors]
-jinja2=jinja2.ext:babel_extract[i18n]
+[console_scripts]
+pip = pip._internal.cli.main:main
+pip3 = pip._internal.cli.main:main
+pip3.10 = pip._internal.cli.main:main
 

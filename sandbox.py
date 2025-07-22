@@ -1,436 +1,530 @@
-"""A sandbox layer that ensures unsafe operations cannot be performed.
-Useful when the template itself comes from an untrusted source.
-"""
-
+import os
+import sys
+import tempfile
 import operator
-import types
-import typing as t
-from _string import formatter_field_name_split  # type: ignore
-from collections import abc
-from collections import deque
-from functools import update_wrapper
-from string import Formatter
+import functools
+import itertools
+import re
+import contextlib
+import pickle
+import textwrap
+import builtins
 
-from markupsafe import EscapeFormatter
-from markupsafe import Markup
+import pkg_resources
+from distutils.errors import DistutilsError
+from pkg_resources import working_set
 
-from .environment import Environment
-from .exceptions import SecurityError
-from .runtime import Context
-from .runtime import Undefined
+if sys.platform.startswith('java'):
+    import org.python.modules.posix.PosixModule as _os
+else:
+    _os = sys.modules[os.name]
+try:
+    _file = file
+except NameError:
+    _file = None
+_open = open
 
-F = t.TypeVar("F", bound=t.Callable[..., t.Any])
 
-#: maximum number of items a range may produce
-MAX_RANGE = 100000
+__all__ = [
+    "AbstractSandbox",
+    "DirectorySandbox",
+    "SandboxViolation",
+    "run_setup",
+]
 
-#: Unsafe function attributes.
-UNSAFE_FUNCTION_ATTRIBUTES: t.Set[str] = set()
 
-#: Unsafe method attributes. Function attributes are unsafe for methods too.
-UNSAFE_METHOD_ATTRIBUTES: t.Set[str] = set()
+def _execfile(filename, globals, locals=None):
+    """
+    Python 3 implementation of execfile.
+    """
+    mode = 'rb'
+    with open(filename, mode) as stream:
+        script = stream.read()
+    if locals is None:
+        locals = globals
+    code = compile(script, filename, 'exec')
+    exec(code, globals, locals)
 
-#: unsafe generator attributes.
-UNSAFE_GENERATOR_ATTRIBUTES = {"gi_frame", "gi_code"}
 
-#: unsafe attributes on coroutines
-UNSAFE_COROUTINE_ATTRIBUTES = {"cr_frame", "cr_code"}
+@contextlib.contextmanager
+def save_argv(repl=None):
+    saved = sys.argv[:]
+    if repl is not None:
+        sys.argv[:] = repl
+    try:
+        yield saved
+    finally:
+        sys.argv[:] = saved
 
-#: unsafe attributes on async generators
-UNSAFE_ASYNC_GENERATOR_ATTRIBUTES = {"ag_code", "ag_frame"}
 
-_mutable_spec: t.Tuple[t.Tuple[t.Type[t.Any], t.FrozenSet[str]], ...] = (
-    (
-        abc.MutableSet,
-        frozenset(
-            [
-                "add",
-                "clear",
-                "difference_update",
-                "discard",
-                "pop",
-                "remove",
-                "symmetric_difference_update",
-                "update",
-            ]
-        ),
-    ),
-    (
-        abc.MutableMapping,
-        frozenset(["clear", "pop", "popitem", "setdefault", "update"]),
-    ),
-    (
-        abc.MutableSequence,
-        frozenset(
-            ["append", "clear", "pop", "reverse", "insert", "sort", "extend", "remove"]
-        ),
-    ),
-    (
-        deque,
-        frozenset(
-            [
-                "append",
-                "appendleft",
-                "clear",
-                "extend",
-                "extendleft",
-                "pop",
-                "popleft",
-                "remove",
-                "rotate",
-            ]
-        ),
-    ),
+@contextlib.contextmanager
+def save_path():
+    saved = sys.path[:]
+    try:
+        yield saved
+    finally:
+        sys.path[:] = saved
+
+
+@contextlib.contextmanager
+def override_temp(replacement):
+    """
+    Monkey-patch tempfile.tempdir with replacement, ensuring it exists
+    """
+    os.makedirs(replacement, exist_ok=True)
+
+    saved = tempfile.tempdir
+
+    tempfile.tempdir = replacement
+
+    try:
+        yield
+    finally:
+        tempfile.tempdir = saved
+
+
+@contextlib.contextmanager
+def pushd(target):
+    saved = os.getcwd()
+    os.chdir(target)
+    try:
+        yield saved
+    finally:
+        os.chdir(saved)
+
+
+class UnpickleableException(Exception):
+    """
+    An exception representing another Exception that could not be pickled.
+    """
+
+    @staticmethod
+    def dump(type, exc):
+        """
+        Always return a dumped (pickled) type and exc. If exc can't be pickled,
+        wrap it in UnpickleableException first.
+        """
+        try:
+            return pickle.dumps(type), pickle.dumps(exc)
+        except Exception:
+            # get UnpickleableException inside the sandbox
+            from setuptools.sandbox import UnpickleableException as cls
+
+            return cls.dump(cls, cls(repr(exc)))
+
+
+class ExceptionSaver:
+    """
+    A Context Manager that will save an exception, serialized, and restore it
+    later.
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, exc, tb):
+        if not exc:
+            return
+
+        # dump the exception
+        self._saved = UnpickleableException.dump(type, exc)
+        self._tb = tb
+
+        # suppress the exception
+        return True
+
+    def resume(self):
+        "restore and re-raise any exception"
+
+        if '_saved' not in vars(self):
+            return
+
+        type, exc = map(pickle.loads, self._saved)
+        raise exc.with_traceback(self._tb)
+
+
+@contextlib.contextmanager
+def save_modules():
+    """
+    Context in which imported modules are saved.
+
+    Translates exceptions internal to the context into the equivalent exception
+    outside the context.
+    """
+    saved = sys.modules.copy()
+    with ExceptionSaver() as saved_exc:
+        yield saved
+
+    sys.modules.update(saved)
+    # remove any modules imported since
+    del_modules = (
+        mod_name
+        for mod_name in sys.modules
+        if mod_name not in saved
+        # exclude any encodings modules. See #285
+        and not mod_name.startswith('encodings.')
+    )
+    _clear_modules(del_modules)
+
+    saved_exc.resume()
+
+
+def _clear_modules(module_names):
+    for mod_name in list(module_names):
+        del sys.modules[mod_name]
+
+
+@contextlib.contextmanager
+def save_pkg_resources_state():
+    saved = pkg_resources.__getstate__()
+    try:
+        yield saved
+    finally:
+        pkg_resources.__setstate__(saved)
+
+
+@contextlib.contextmanager
+def setup_context(setup_dir):
+    temp_dir = os.path.join(setup_dir, 'temp')
+    with save_pkg_resources_state():
+        with save_modules():
+            with save_path():
+                hide_setuptools()
+                with save_argv():
+                    with override_temp(temp_dir):
+                        with pushd(setup_dir):
+                            # ensure setuptools commands are available
+                            __import__('setuptools')
+                            yield
+
+
+_MODULES_TO_HIDE = {
+    'setuptools',
+    'distutils',
+    'pkg_resources',
+    'Cython',
+    '_distutils_hack',
+}
+
+
+def _needs_hiding(mod_name):
+    """
+    >>> _needs_hiding('setuptools')
+    True
+    >>> _needs_hiding('pkg_resources')
+    True
+    >>> _needs_hiding('setuptools_plugin')
+    False
+    >>> _needs_hiding('setuptools.__init__')
+    True
+    >>> _needs_hiding('distutils')
+    True
+    >>> _needs_hiding('os')
+    False
+    >>> _needs_hiding('Cython')
+    True
+    """
+    base_module = mod_name.split('.', 1)[0]
+    return base_module in _MODULES_TO_HIDE
+
+
+def hide_setuptools():
+    """
+    Remove references to setuptools' modules from sys.modules to allow the
+    invocation to import the most appropriate setuptools. This technique is
+    necessary to avoid issues such as #315 where setuptools upgrading itself
+    would fail to find a function declared in the metadata.
+    """
+    _distutils_hack = sys.modules.get('_distutils_hack', None)
+    if _distutils_hack is not None:
+        _distutils_hack.remove_shim()
+
+    modules = filter(_needs_hiding, sys.modules)
+    _clear_modules(modules)
+
+
+def run_setup(setup_script, args):
+    """Run a distutils setup script, sandboxed in its directory"""
+    setup_dir = os.path.abspath(os.path.dirname(setup_script))
+    with setup_context(setup_dir):
+        try:
+            sys.argv[:] = [setup_script] + list(args)
+            sys.path.insert(0, setup_dir)
+            # reset to include setup dir, w/clean callback list
+            working_set.__init__()
+            working_set.callbacks.append(lambda dist: dist.activate())
+
+            with DirectorySandbox(setup_dir):
+                ns = dict(__file__=setup_script, __name__='__main__')
+                _execfile(setup_script, ns)
+        except SystemExit as v:
+            if v.args and v.args[0]:
+                raise
+            # Normal exit, just return
+
+
+class AbstractSandbox:
+    """Wrap 'os' module and 'open()' builtin for virtualizing setup scripts"""
+
+    _active = False
+
+    def __init__(self):
+        self._attrs = [
+            name
+            for name in dir(_os)
+            if not name.startswith('_') and hasattr(self, name)
+        ]
+
+    def _copy(self, source):
+        for name in self._attrs:
+            setattr(os, name, getattr(source, name))
+
+    def __enter__(self):
+        self._copy(self)
+        if _file:
+            builtins.file = self._file
+        builtins.open = self._open
+        self._active = True
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._active = False
+        if _file:
+            builtins.file = _file
+        builtins.open = _open
+        self._copy(_os)
+
+    def run(self, func):
+        """Run 'func' under os sandboxing"""
+        with self:
+            return func()
+
+    def _mk_dual_path_wrapper(name):
+        original = getattr(_os, name)
+
+        def wrap(self, src, dst, *args, **kw):
+            if self._active:
+                src, dst = self._remap_pair(name, src, dst, *args, **kw)
+            return original(src, dst, *args, **kw)
+
+        return wrap
+
+    for name in ["rename", "link", "symlink"]:
+        if hasattr(_os, name):
+            locals()[name] = _mk_dual_path_wrapper(name)
+
+    def _mk_single_path_wrapper(name, original=None):
+        original = original or getattr(_os, name)
+
+        def wrap(self, path, *args, **kw):
+            if self._active:
+                path = self._remap_input(name, path, *args, **kw)
+            return original(path, *args, **kw)
+
+        return wrap
+
+    if _file:
+        _file = _mk_single_path_wrapper('file', _file)
+    _open = _mk_single_path_wrapper('open', _open)
+    for name in [
+        "stat",
+        "listdir",
+        "chdir",
+        "open",
+        "chmod",
+        "chown",
+        "mkdir",
+        "remove",
+        "unlink",
+        "rmdir",
+        "utime",
+        "lchown",
+        "chroot",
+        "lstat",
+        "startfile",
+        "mkfifo",
+        "mknod",
+        "pathconf",
+        "access",
+    ]:
+        if hasattr(_os, name):
+            locals()[name] = _mk_single_path_wrapper(name)
+
+    def _mk_single_with_return(name):
+        original = getattr(_os, name)
+
+        def wrap(self, path, *args, **kw):
+            if self._active:
+                path = self._remap_input(name, path, *args, **kw)
+                return self._remap_output(name, original(path, *args, **kw))
+            return original(path, *args, **kw)
+
+        return wrap
+
+    for name in ['readlink', 'tempnam']:
+        if hasattr(_os, name):
+            locals()[name] = _mk_single_with_return(name)
+
+    def _mk_query(name):
+        original = getattr(_os, name)
+
+        def wrap(self, *args, **kw):
+            retval = original(*args, **kw)
+            if self._active:
+                return self._remap_output(name, retval)
+            return retval
+
+        return wrap
+
+    for name in ['getcwd', 'tmpnam']:
+        if hasattr(_os, name):
+            locals()[name] = _mk_query(name)
+
+    def _validate_path(self, path):
+        """Called to remap or validate any path, whether input or output"""
+        return path
+
+    def _remap_input(self, operation, path, *args, **kw):
+        """Called for path inputs"""
+        return self._validate_path(path)
+
+    def _remap_output(self, operation, path):
+        """Called for path outputs"""
+        return self._validate_path(path)
+
+    def _remap_pair(self, operation, src, dst, *args, **kw):
+        """Called for path pairs like rename, link, and symlink operations"""
+        return (
+            self._remap_input(operation + '-from', src, *args, **kw),
+            self._remap_input(operation + '-to', dst, *args, **kw),
+        )
+
+
+if hasattr(os, 'devnull'):
+    _EXCEPTIONS = [os.devnull]
+else:
+    _EXCEPTIONS = []
+
+
+class DirectorySandbox(AbstractSandbox):
+    """Restrict operations to a single subdirectory - pseudo-chroot"""
+
+    write_ops = dict.fromkeys(
+        [
+            "open",
+            "chmod",
+            "chown",
+            "mkdir",
+            "remove",
+            "unlink",
+            "rmdir",
+            "utime",
+            "lchown",
+            "chroot",
+            "mkfifo",
+            "mknod",
+            "tempnam",
+        ]
+    )
+
+    _exception_patterns = []
+    "exempt writing to paths that match the pattern"
+
+    def __init__(self, sandbox, exceptions=_EXCEPTIONS):
+        self._sandbox = os.path.normcase(os.path.realpath(sandbox))
+        self._prefix = os.path.join(self._sandbox, '')
+        self._exceptions = [
+            os.path.normcase(os.path.realpath(path)) for path in exceptions
+        ]
+        AbstractSandbox.__init__(self)
+
+    def _violation(self, operation, *args, **kw):
+        from setuptools.sandbox import SandboxViolation
+
+        raise SandboxViolation(operation, args, kw)
+
+    if _file:
+
+        def _file(self, path, mode='r', *args, **kw):
+            if mode not in ('r', 'rt', 'rb', 'rU', 'U') and not self._ok(path):
+                self._violation("file", path, mode, *args, **kw)
+            return _file(path, mode, *args, **kw)
+
+    def _open(self, path, mode='r', *args, **kw):
+        if mode not in ('r', 'rt', 'rb', 'rU', 'U') and not self._ok(path):
+            self._violation("open", path, mode, *args, **kw)
+        return _open(path, mode, *args, **kw)
+
+    def tmpnam(self):
+        self._violation("tmpnam")
+
+    def _ok(self, path):
+        active = self._active
+        try:
+            self._active = False
+            realpath = os.path.normcase(os.path.realpath(path))
+            return (
+                self._exempted(realpath)
+                or realpath == self._sandbox
+                or realpath.startswith(self._prefix)
+            )
+        finally:
+            self._active = active
+
+    def _exempted(self, filepath):
+        start_matches = (
+            filepath.startswith(exception) for exception in self._exceptions
+        )
+        pattern_matches = (
+            re.match(pattern, filepath) for pattern in self._exception_patterns
+        )
+        candidates = itertools.chain(start_matches, pattern_matches)
+        return any(candidates)
+
+    def _remap_input(self, operation, path, *args, **kw):
+        """Called for path inputs"""
+        if operation in self.write_ops and not self._ok(path):
+            self._violation(operation, os.path.realpath(path), *args, **kw)
+        return path
+
+    def _remap_pair(self, operation, src, dst, *args, **kw):
+        """Called for path pairs like rename, link, and symlink operations"""
+        if not self._ok(src) or not self._ok(dst):
+            self._violation(operation, src, dst, *args, **kw)
+        return (src, dst)
+
+    def open(self, file, flags, mode=0o777, *args, **kw):
+        """Called for low-level os.open()"""
+        if flags & WRITE_FLAGS and not self._ok(file):
+            self._violation("os.open", file, flags, mode, *args, **kw)
+        return _os.open(file, flags, mode, *args, **kw)
+
+
+WRITE_FLAGS = functools.reduce(
+    operator.or_,
+    [
+        getattr(_os, a, 0)
+        for a in "O_WRONLY O_RDWR O_APPEND O_CREAT O_TRUNC O_TEMPORARY".split()
+    ],
 )
 
 
-def safe_range(*args: int) -> range:
-    """A range that can't generate ranges with a length of more than
-    MAX_RANGE items.
-    """
-    rng = range(*args)
+class SandboxViolation(DistutilsError):
+    """A setup script attempted to modify the filesystem outside the sandbox"""
 
-    if len(rng) > MAX_RANGE:
-        raise OverflowError(
-            "Range too big. The sandbox blocks ranges larger than"
-            f" MAX_RANGE ({MAX_RANGE})."
-        )
-
-    return rng
-
-
-def unsafe(f: F) -> F:
-    """Marks a function or method as unsafe.
-
-    .. code-block: python
-
-        @unsafe
-        def delete(self):
-            pass
-    """
-    f.unsafe_callable = True  # type: ignore
-    return f
-
-
-def is_internal_attribute(obj: t.Any, attr: str) -> bool:
-    """Test if the attribute given is an internal python attribute.  For
-    example this function returns `True` for the `func_code` attribute of
-    python objects.  This is useful if the environment method
-    :meth:`~SandboxedEnvironment.is_safe_attribute` is overridden.
-
-    >>> from jinja2.sandbox import is_internal_attribute
-    >>> is_internal_attribute(str, "mro")
-    True
-    >>> is_internal_attribute(str, "upper")
-    False
-    """
-    if isinstance(obj, types.FunctionType):
-        if attr in UNSAFE_FUNCTION_ATTRIBUTES:
-            return True
-    elif isinstance(obj, types.MethodType):
-        if attr in UNSAFE_FUNCTION_ATTRIBUTES or attr in UNSAFE_METHOD_ATTRIBUTES:
-            return True
-    elif isinstance(obj, type):
-        if attr == "mro":
-            return True
-    elif isinstance(obj, (types.CodeType, types.TracebackType, types.FrameType)):
-        return True
-    elif isinstance(obj, types.GeneratorType):
-        if attr in UNSAFE_GENERATOR_ATTRIBUTES:
-            return True
-    elif hasattr(types, "CoroutineType") and isinstance(obj, types.CoroutineType):
-        if attr in UNSAFE_COROUTINE_ATTRIBUTES:
-            return True
-    elif hasattr(types, "AsyncGeneratorType") and isinstance(
-        obj, types.AsyncGeneratorType
-    ):
-        if attr in UNSAFE_ASYNC_GENERATOR_ATTRIBUTES:
-            return True
-    return attr.startswith("__")
-
-
-def modifies_known_mutable(obj: t.Any, attr: str) -> bool:
-    """This function checks if an attribute on a builtin mutable object
-    (list, dict, set or deque) or the corresponding ABCs would modify it
-    if called.
-
-    >>> modifies_known_mutable({}, "clear")
-    True
-    >>> modifies_known_mutable({}, "keys")
-    False
-    >>> modifies_known_mutable([], "append")
-    True
-    >>> modifies_known_mutable([], "index")
-    False
-
-    If called with an unsupported object, ``False`` is returned.
-
-    >>> modifies_known_mutable("foo", "upper")
-    False
-    """
-    for typespec, unsafe in _mutable_spec:
-        if isinstance(obj, typespec):
-            return attr in unsafe
-    return False
-
-
-class SandboxedEnvironment(Environment):
-    """The sandboxed environment.  It works like the regular environment but
-    tells the compiler to generate sandboxed code.  Additionally subclasses of
-    this environment may override the methods that tell the runtime what
-    attributes or functions are safe to access.
-
-    If the template tries to access insecure code a :exc:`SecurityError` is
-    raised.  However also other exceptions may occur during the rendering so
-    the caller has to ensure that all exceptions are caught.
-    """
-
-    sandboxed = True
-
-    #: default callback table for the binary operators.  A copy of this is
-    #: available on each instance of a sandboxed environment as
-    #: :attr:`binop_table`
-    default_binop_table: t.Dict[str, t.Callable[[t.Any, t.Any], t.Any]] = {
-        "+": operator.add,
-        "-": operator.sub,
-        "*": operator.mul,
-        "/": operator.truediv,
-        "//": operator.floordiv,
-        "**": operator.pow,
-        "%": operator.mod,
-    }
-
-    #: default callback table for the unary operators.  A copy of this is
-    #: available on each instance of a sandboxed environment as
-    #: :attr:`unop_table`
-    default_unop_table: t.Dict[str, t.Callable[[t.Any], t.Any]] = {
-        "+": operator.pos,
-        "-": operator.neg,
-    }
-
-    #: a set of binary operators that should be intercepted.  Each operator
-    #: that is added to this set (empty by default) is delegated to the
-    #: :meth:`call_binop` method that will perform the operator.  The default
-    #: operator callback is specified by :attr:`binop_table`.
-    #:
-    #: The following binary operators are interceptable:
-    #: ``//``, ``%``, ``+``, ``*``, ``-``, ``/``, and ``**``
-    #:
-    #: The default operation form the operator table corresponds to the
-    #: builtin function.  Intercepted calls are always slower than the native
-    #: operator call, so make sure only to intercept the ones you are
-    #: interested in.
-    #:
-    #: .. versionadded:: 2.6
-    intercepted_binops: t.FrozenSet[str] = frozenset()
-
-    #: a set of unary operators that should be intercepted.  Each operator
-    #: that is added to this set (empty by default) is delegated to the
-    #: :meth:`call_unop` method that will perform the operator.  The default
-    #: operator callback is specified by :attr:`unop_table`.
-    #:
-    #: The following unary operators are interceptable: ``+``, ``-``
-    #:
-    #: The default operation form the operator table corresponds to the
-    #: builtin function.  Intercepted calls are always slower than the native
-    #: operator call, so make sure only to intercept the ones you are
-    #: interested in.
-    #:
-    #: .. versionadded:: 2.6
-    intercepted_unops: t.FrozenSet[str] = frozenset()
-
-    def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.globals["range"] = safe_range
-        self.binop_table = self.default_binop_table.copy()
-        self.unop_table = self.default_unop_table.copy()
-
-    def is_safe_attribute(self, obj: t.Any, attr: str, value: t.Any) -> bool:
-        """The sandboxed environment will call this method to check if the
-        attribute of an object is safe to access.  Per default all attributes
-        starting with an underscore are considered private as well as the
-        special attributes of internal python objects as returned by the
-        :func:`is_internal_attribute` function.
+    tmpl = textwrap.dedent(
         """
-        return not (attr.startswith("_") or is_internal_attribute(obj, attr))
+        SandboxViolation: {cmd}{args!r} {kwargs}
 
-    def is_safe_callable(self, obj: t.Any) -> bool:
-        """Check if an object is safely callable. By default callables
-        are considered safe unless decorated with :func:`unsafe`.
+        The package setup script has attempted to modify files on your system
+        that are not within the EasyInstall build area, and has been aborted.
 
-        This also recognizes the Django convention of setting
-        ``func.alters_data = True``.
+        This package cannot be safely installed by EasyInstall, and may not
+        support alternate installation locations even if you run its setup
+        script by hand.  Please inform the package's author and the EasyInstall
+        maintainers to find out if a fix or workaround is available.
         """
-        return not (
-            getattr(obj, "unsafe_callable", False) or getattr(obj, "alters_data", False)
-        )
+    ).lstrip()
 
-    def call_binop(
-        self, context: Context, operator: str, left: t.Any, right: t.Any
-    ) -> t.Any:
-        """For intercepted binary operator calls (:meth:`intercepted_binops`)
-        this function is executed instead of the builtin operator.  This can
-        be used to fine tune the behavior of certain operators.
-
-        .. versionadded:: 2.6
-        """
-        return self.binop_table[operator](left, right)
-
-    def call_unop(self, context: Context, operator: str, arg: t.Any) -> t.Any:
-        """For intercepted unary operator calls (:meth:`intercepted_unops`)
-        this function is executed instead of the builtin operator.  This can
-        be used to fine tune the behavior of certain operators.
-
-        .. versionadded:: 2.6
-        """
-        return self.unop_table[operator](arg)
-
-    def getitem(
-        self, obj: t.Any, argument: t.Union[str, t.Any]
-    ) -> t.Union[t.Any, Undefined]:
-        """Subscribe an object from sandboxed code."""
-        try:
-            return obj[argument]
-        except (TypeError, LookupError):
-            if isinstance(argument, str):
-                try:
-                    attr = str(argument)
-                except Exception:
-                    pass
-                else:
-                    try:
-                        value = getattr(obj, attr)
-                    except AttributeError:
-                        pass
-                    else:
-                        fmt = self.wrap_str_format(value)
-                        if fmt is not None:
-                            return fmt
-                        if self.is_safe_attribute(obj, argument, value):
-                            return value
-                        return self.unsafe_undefined(obj, argument)
-        return self.undefined(obj=obj, name=argument)
-
-    def getattr(self, obj: t.Any, attribute: str) -> t.Union[t.Any, Undefined]:
-        """Subscribe an object from sandboxed code and prefer the
-        attribute.  The attribute passed *must* be a bytestring.
-        """
-        try:
-            value = getattr(obj, attribute)
-        except AttributeError:
-            try:
-                return obj[attribute]
-            except (TypeError, LookupError):
-                pass
-        else:
-            fmt = self.wrap_str_format(value)
-            if fmt is not None:
-                return fmt
-            if self.is_safe_attribute(obj, attribute, value):
-                return value
-            return self.unsafe_undefined(obj, attribute)
-        return self.undefined(obj=obj, name=attribute)
-
-    def unsafe_undefined(self, obj: t.Any, attribute: str) -> Undefined:
-        """Return an undefined object for unsafe attributes."""
-        return self.undefined(
-            f"access to attribute {attribute!r} of"
-            f" {type(obj).__name__!r} object is unsafe.",
-            name=attribute,
-            obj=obj,
-            exc=SecurityError,
-        )
-
-    def wrap_str_format(self, value: t.Any) -> t.Optional[t.Callable[..., str]]:
-        """If the given value is a ``str.format`` or ``str.format_map`` method,
-        return a new function than handles sandboxing. This is done at access
-        rather than in :meth:`call`, so that calls made without ``call`` are
-        also sandboxed.
-        """
-        if not isinstance(
-            value, (types.MethodType, types.BuiltinMethodType)
-        ) or value.__name__ not in ("format", "format_map"):
-            return None
-
-        f_self: t.Any = value.__self__
-
-        if not isinstance(f_self, str):
-            return None
-
-        str_type: t.Type[str] = type(f_self)
-        is_format_map = value.__name__ == "format_map"
-        formatter: SandboxedFormatter
-
-        if isinstance(f_self, Markup):
-            formatter = SandboxedEscapeFormatter(self, escape=f_self.escape)
-        else:
-            formatter = SandboxedFormatter(self)
-
-        vformat = formatter.vformat
-
-        def wrapper(*args: t.Any, **kwargs: t.Any) -> str:
-            if is_format_map:
-                if kwargs:
-                    raise TypeError("format_map() takes no keyword arguments")
-
-                if len(args) != 1:
-                    raise TypeError(
-                        f"format_map() takes exactly one argument ({len(args)} given)"
-                    )
-
-                kwargs = args[0]
-                args = ()
-
-            return str_type(vformat(f_self, args, kwargs))
-
-        return update_wrapper(wrapper, value)
-
-    def call(
-        __self,  # noqa: B902
-        __context: Context,
-        __obj: t.Any,
-        *args: t.Any,
-        **kwargs: t.Any,
-    ) -> t.Any:
-        """Call an object from sandboxed code."""
-
-        # the double prefixes are to avoid double keyword argument
-        # errors when proxying the call.
-        if not __self.is_safe_callable(__obj):
-            raise SecurityError(f"{__obj!r} is not safely callable")
-        return __context.call(__obj, *args, **kwargs)
-
-
-class ImmutableSandboxedEnvironment(SandboxedEnvironment):
-    """Works exactly like the regular `SandboxedEnvironment` but does not
-    permit modifications on the builtin mutable objects `list`, `set`, and
-    `dict` by using the :func:`modifies_known_mutable` function.
-    """
-
-    def is_safe_attribute(self, obj: t.Any, attr: str, value: t.Any) -> bool:
-        if not super().is_safe_attribute(obj, attr, value):
-            return False
-
-        return not modifies_known_mutable(obj, attr)
-
-
-class SandboxedFormatter(Formatter):
-    def __init__(self, env: Environment, **kwargs: t.Any) -> None:
-        self._env = env
-        super().__init__(**kwargs)
-
-    def get_field(
-        self, field_name: str, args: t.Sequence[t.Any], kwargs: t.Mapping[str, t.Any]
-    ) -> t.Tuple[t.Any, str]:
-        first, rest = formatter_field_name_split(field_name)
-        obj = self.get_value(first, args, kwargs)
-        for is_attr, i in rest:
-            if is_attr:
-                obj = self._env.getattr(obj, i)
-            else:
-                obj = self._env.getitem(obj, i)
-        return obj, first
-
-
-class SandboxedEscapeFormatter(SandboxedFormatter, EscapeFormatter):
-    pass
+    def __str__(self):
+        cmd, args, kwargs = self.args
+        return self.tmpl.format(**locals())
